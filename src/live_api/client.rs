@@ -1,9 +1,11 @@
 use super::wbi;
 use super::{LiveApi, LiveApiError, LiveAuth, LiveEndpoint};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct LiveApiClient {
@@ -21,6 +23,7 @@ impl LiveApiClient {
     pub fn new(api_concurrency_limit: usize) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .timeout(HTTP_TIMEOUT)
             .build()
             .expect("client build");
         let api_semaphore = Arc::new(Semaphore::new(api_concurrency_limit));

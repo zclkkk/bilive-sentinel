@@ -657,6 +657,8 @@ async fn run_room_inner(
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
     status: Option<&RoomStatusReporter>,
 ) -> Result<()> {
+    const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
     let endpoint = auth
         .endpoints
         .first()
@@ -669,7 +671,9 @@ async fn run_room_inner(
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
-        connect_async(&url).await?
+        tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url))
+            .await
+            .map_err(|_| anyhow::anyhow!("websocket connect timed out"))??
     };
     let (mut write, mut read) = ws_stream.split();
 
