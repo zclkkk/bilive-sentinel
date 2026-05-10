@@ -12,12 +12,12 @@ const NUM_ROOMS: usize = 5;
 const EVENTS_PER_ROOM: usize = 20;
 
 fn unique_base_room_id() -> u64 {
-    let ts = std::time::SystemTime::now()
+    let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
-    // Use last 5 digits of timestamp * 100 to get a range like 1234500..1234505
-    (ts % 100_000) * 100
+        .as_nanos();
+    // Use lower digits of nanosecond timestamp to avoid collision across runs
+    (ns % 1_000_000_000) as u64 * 100
 }
 
 fn make_danmaku(_room_id: u64, seq: u64) -> DanmakuEvent {
@@ -50,11 +50,11 @@ fn make_gift(_room_id: u64, seq: u64) -> GiftEvent {
 async fn multi_room_publish_and_consume() {
     // Setup
     let base_room_id = unique_base_room_id();
-    let ts = std::time::SystemTime::now()
+    let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
-    let consumer_group = format!("test-stability-{ts}");
+        .as_nanos();
+    let consumer_group = format!("test-stability-{ns}");
 
     ensure_topics(BOOTSTRAP_SERVERS)
         .await
@@ -205,14 +205,8 @@ async fn multi_room_publish_and_consume() {
     }
 
     // Verify counts
-    assert!(
-        danmaku_count == total_expected,
-        "expected {total_expected} danmaku, got {danmaku_count}"
-    );
-    assert!(
-        gift_count == total_expected,
-        "expected {total_expected} gifts, got {gift_count}"
-    );
+    assert_eq!(danmaku_count, total_expected, "danmaku count mismatch");
+    assert_eq!(gift_count, total_expected, "gift count mismatch");
 
     // Verify ClickHouse has records for this room range only
     let query = format!(
@@ -225,9 +219,9 @@ async fn multi_room_publish_and_consume() {
         .expect("query danmaku count");
     let body = resp.text().await.expect("body");
     let ch_danmaku: u64 = body.trim().parse().expect("parse count");
-    assert!(
-        ch_danmaku == total_expected as u64,
-        "ClickHouse danmaku: expected {total_expected}, got {ch_danmaku}"
+    assert_eq!(
+        ch_danmaku, total_expected as u64,
+        "ClickHouse danmaku count mismatch"
     );
 
     let query = format!(
@@ -240,8 +234,8 @@ async fn multi_room_publish_and_consume() {
         .expect("query gift count");
     let body = resp.text().await.expect("body");
     let ch_gifts: u64 = body.trim().parse().expect("parse count");
-    assert!(
-        ch_gifts == total_expected as u64,
-        "ClickHouse gifts: expected {total_expected}, got {ch_gifts}"
+    assert_eq!(
+        ch_gifts, total_expected as u64,
+        "ClickHouse gifts count mismatch"
     );
 }
