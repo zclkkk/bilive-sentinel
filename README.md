@@ -271,6 +271,17 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | `bilibili.live.gift.v1` | room_id | `LiveMessage<GiftEvent>`（JSON） |
 | `bilibili.live.room_status.v1` | room_id | 预留房间状态事件 |
 
+## 当前已知限制
+
+| 限制项 | 当前是否存在 | 是否可解决 | 说明 |
+|--------|--------------|------------|------|
+| registry 测试依赖本地 PostgreSQL | 是 | 可以 | 目前 `registry` 单元测试直接连接 `localhost:5432`，可改为 testcontainers、临时数据库，或将依赖基础设施的测试移动到集成测试。 |
+| writer 提交 offset 失败只记录 warning，没有重试 | 部分存在 | 可以 | 当前会记录指标并保留 batch，但更理想的是区分“已写入但未提交”的状态，先重试提交 offset，避免重新写入 ClickHouse 造成重复。 |
+| writer 每个 topic 只跟踪最后一条消息 offset | 是 | 可以，建议优先修 | topic 已经支持多 partition，但 writer 仍只保存每个 topic 的最后一条消息；如果 batch 混入多个 partition，其他 partition 的 offset 可能不会被提交。 |
+| consumer lag 只读取本地 consumer 状态 | 是 | 可以 | 当前 lag 基于 consumer position 与 committed offset，不能代表 broker 端真实 high watermark lag；可改为按 partition 查询 watermark 后计算。 |
+| API 没有认证 | 是 | 可以 | 本地开发可接受，但生产或公网部署前需要加鉴权、网络隔离，或放在受保护的管理网内。 |
+| auth 失效判断仍使用简单错误字符串匹配 | 是 | 可以 | 当前根据错误文本决定是否复用 auth；可改成结构化错误类型，明确区分网络、endpoint、auth、权限/session 等失败。 |
+
 ## 测试
 
 ```bash
