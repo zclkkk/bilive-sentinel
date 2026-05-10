@@ -234,7 +234,7 @@ async fn run_single_room(
                 if retries > settings.reconnect_max_retries {
                     return Err(anyhow::anyhow!("max retries exceeded: {e}"));
                 }
-                if should_reuse_auth(&e.to_string()) {
+                if !should_refresh_auth(&e) {
                     cached_auth = Some(auth);
                 }
                 let delay = next_backoff(settings, retries);
@@ -507,7 +507,7 @@ async fn run_claimed_room(context: CollectorContext, room_id: u64) {
             RoomLoopResult::Disconnected(Err(e)) => {
                 let msg = e.to_string();
                 status.mark_error(&msg).await;
-                if should_reuse_auth(&msg) {
+                if !should_refresh_auth(&e) {
                     cached_auth = Some(auth);
                 }
                 tracing::warn!(room_id, error = %e, "room disconnected");
@@ -539,7 +539,7 @@ async fn run_claimed_room(context: CollectorContext, room_id: u64) {
 }
 
 enum RoomLoopResult {
-    Disconnected(Result<()>),
+    Disconnected(std::result::Result<(), RoomError>),
     Stopped(Result<String>),
 }
 
@@ -601,10 +601,6 @@ fn truncate_status_error(error: &str) -> String {
     error.chars().take(MAX_ERROR_LEN).collect()
 }
 
-fn should_reuse_auth(error: &str) -> bool {
-    !error.contains("no endpoints") && !error.contains("auth")
-}
-
 fn next_backoff(settings: RoomTaskSettings, retries: u32) -> Duration {
     bilive_sentinel::backoff::calculate_backoff(
         settings.reconnect_base_ms,
@@ -645,7 +641,7 @@ async fn run_room(
     endpoint_semaphore: &Arc<Semaphore>,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
     status: Option<&RoomStatusReporter>,
-) -> Result<()> {
+) -> std::result::Result<(), RoomError> {
     let _active_room = ActiveRoomGuard::new(metrics.active_rooms.clone());
     run_room_inner(auth, producer, endpoint_semaphore, metrics, status).await
 }
@@ -656,11 +652,11 @@ async fn run_room_inner(
     endpoint_semaphore: &Arc<Semaphore>,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
     status: Option<&RoomStatusReporter>,
-) -> Result<()> {
+) -> std::result::Result<(), RoomError> {
     const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
     if auth.endpoints.is_empty() {
-        return Err(anyhow::anyhow!("no endpoints"));
+        return Err(RoomError::NoEndpoint);
     }
 
     let mut ws_stream = None;
@@ -673,7 +669,7 @@ async fn run_room_inner(
         let ep_permit = endpoint_semaphore
             .acquire()
             .await
-            .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
+            .map_err(|_| RoomError::Endpoint("endpoint limiter closed".into()))?;
 
         let result = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await;
         drop(ep_permit);
@@ -686,17 +682,17 @@ async fn run_room_inner(
             }
             Ok(Err(e)) => {
                 tracing::warn!(url, error = %e, "endpoint connection failed");
-                last_error = Some(anyhow::anyhow!("{e}"));
+                last_error = Some(RoomError::Endpoint(e.to_string()));
             }
             Err(_) => {
                 tracing::warn!(url, "endpoint connection timed out");
-                last_error = Some(anyhow::anyhow!("websocket connect timed out"));
+                last_error = Some(RoomError::Endpoint("websocket connect timed out".into()));
             }
         }
     }
 
     let Some(ws_stream) = ws_stream else {
-        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")));
+        return Err(last_error.unwrap_or(RoomError::Endpoint("all endpoints failed".into())));
     };
 
     let (mut write, mut read) = ws_stream.split();
@@ -712,7 +708,10 @@ async fn run_room_inner(
         "buvid": auth.buvid3,
     });
     let auth_packet = protocol::build_packet(OP_AUTH, &auth_body.to_string());
-    write.send(Message::Binary(auth_packet.into())).await?;
+    write
+        .send(Message::Binary(auth_packet.into()))
+        .await
+        .map_err(|e| RoomError::Auth(e.to_string()))?;
     tracing::info!("auth sent");
 
     let room_id = auth.room_id;
@@ -722,13 +721,14 @@ async fn run_room_inner(
         tokio::select! {
             _ = heartbeat.tick() => {
                 let packet = protocol::build_packet(OP_HEARTBEAT, "");
-                write.send(Message::Binary(packet.into())).await?;
+                write.send(Message::Binary(packet.into())).await
+                    .map_err(|e| RoomError::Network(e.to_string()))?;
             }
             msg = read.next() => {
                 let Some(msg) = msg else {
-                    return Err(anyhow::anyhow!("websocket stream ended"));
+                    return Err(RoomError::Network("websocket stream ended".into()));
                 };
-                match msg? {
+                match msg.map_err(|e| RoomError::Network(e.to_string()))? {
                     Message::Binary(data) => {
                         let packets = protocol::parse_packets(&data);
                         for pkt in packets {
@@ -739,20 +739,20 @@ async fn run_room_inner(
                             }
                             if let Err(e) = handle_packet(room_id, &pkt, producer, metrics).await {
                                 match &e {
-                                    PacketError::Parser(_) => {
+                                    RoomError::Protocol(_) => {
                                         tracing::warn!(error = %e, "handle_packet failed");
                                         metrics.parser_errors_total.inc();
                                     }
-                                    PacketError::Publish(_) => {
+                                    _ => {
                                         tracing::warn!(error = %e, "handle_packet failed");
                                     }
                                 }
-                                return Err(anyhow::anyhow!("{e}"));
+                                return Err(e);
                             }
                         }
                     }
                     Message::Close(frame) => {
-                        return Err(anyhow::anyhow!("websocket closed: {frame:?}"));
+                        return Err(RoomError::Network(format!("websocket closed: {frame:?}")));
                     }
                     _ => {}
                 }
@@ -761,17 +761,33 @@ async fn run_room_inner(
     }
 }
 
-enum PacketError {
-    Parser(anyhow::Error),
-    Publish(anyhow::Error),
+#[derive(Debug)]
+enum RoomError {
+    NoEndpoint,
+    Endpoint(String),
+    Auth(String),
+    Network(String),
+    Protocol(String),
+    Publish(String),
 }
 
-impl std::fmt::Display for PacketError {
+impl std::fmt::Display for RoomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PacketError::Parser(e) => write!(f, "parser: {e}"),
-            PacketError::Publish(e) => write!(f, "publish: {e}"),
+            RoomError::NoEndpoint => write!(f, "no endpoints"),
+            RoomError::Endpoint(e) => write!(f, "endpoint: {e}"),
+            RoomError::Auth(e) => write!(f, "auth: {e}"),
+            RoomError::Network(e) => write!(f, "network: {e}"),
+            RoomError::Protocol(e) => write!(f, "protocol: {e}"),
+            RoomError::Publish(e) => write!(f, "publish: {e}"),
         }
+    }
+}
+
+fn should_refresh_auth(error: &RoomError) -> bool {
+    match error {
+        RoomError::NoEndpoint | RoomError::Endpoint(_) | RoomError::Auth(_) => true,
+        RoomError::Network(_) | RoomError::Protocol(_) | RoomError::Publish(_) => false,
     }
 }
 
@@ -780,14 +796,14 @@ async fn handle_packet(
     pkt: &ParsedPacket,
     producer: &RedpandaProducer,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
-) -> std::result::Result<(), PacketError> {
+) -> std::result::Result<(), RoomError> {
     match pkt.op {
         protocol::OP_MESSAGE => {
             let inner_packets = match pkt.protover {
                 protocol::PROTOVER_PLAIN => vec![pkt.clone()],
                 protocol::PROTOVER_DEFLATE | protocol::PROTOVER_BROTLI => {
                     let decompressed = protocol::decompress_body(pkt.protover, &pkt.body)
-                        .map_err(|e| PacketError::Parser(anyhow::anyhow!("decompress: {e}")))?;
+                        .map_err(|e| RoomError::Protocol(format!("decompress: {e}")))?;
                     protocol::parse_packets(&decompressed)
                 }
                 _ => return Ok(()),
@@ -802,13 +818,13 @@ async fn handle_packet(
                         LiveEvent::Danmaku(ev) => {
                             publish_danmaku_with_retry(room_id, producer, metrics, &ev)
                                 .await
-                                .map_err(PacketError::Publish)?;
+                                .map_err(|e| RoomError::Publish(e.to_string()))?;
                             metrics.events_total.with_label_values(&["danmaku"]).inc();
                         }
                         LiveEvent::Gift(ev) => {
                             publish_gift_with_retry(room_id, producer, metrics, &ev)
                                 .await
-                                .map_err(PacketError::Publish)?;
+                                .map_err(|e| RoomError::Publish(e.to_string()))?;
                             metrics.events_total.with_label_values(&["gift"]).inc();
                         }
                         LiveEvent::Malformed { command } => {
@@ -883,4 +899,51 @@ async fn publish_gift_with_retry(
         "publish gift failed after retries: {}",
         last_error.unwrap_or_else(|| "unknown".into())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_auth_for_endpoint_errors() {
+        assert!(should_refresh_auth(&RoomError::NoEndpoint));
+        assert!(should_refresh_auth(&RoomError::Endpoint(
+            "connection refused".into()
+        )));
+        assert!(should_refresh_auth(&RoomError::Endpoint(
+            "websocket connect timed out".into()
+        )));
+    }
+
+    #[test]
+    fn refresh_auth_for_auth_errors() {
+        assert!(should_refresh_auth(&RoomError::Auth(
+            "auth packet send failed".into()
+        )));
+    }
+
+    #[test]
+    fn reuse_auth_for_network_errors() {
+        assert!(!should_refresh_auth(&RoomError::Network(
+            "websocket stream ended".into()
+        )));
+        assert!(!should_refresh_auth(&RoomError::Network(
+            "connection reset".into()
+        )));
+    }
+
+    #[test]
+    fn reuse_auth_for_protocol_errors() {
+        assert!(!should_refresh_auth(&RoomError::Protocol(
+            "decompress: invalid data".into()
+        )));
+    }
+
+    #[test]
+    fn reuse_auth_for_publish_errors() {
+        assert!(!should_refresh_auth(&RoomError::Publish(
+            "publish failed after retries".into()
+        )));
+    }
 }
