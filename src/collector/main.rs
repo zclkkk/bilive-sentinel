@@ -710,9 +710,16 @@ async fn run_room_inner(
                                 status.mark_connected().await;
                             }
                             if let Err(e) = handle_packet(room_id, &pkt, producer, metrics).await {
-                                tracing::warn!(error = %e, "handle_packet failed");
-                                metrics.parser_errors_total.inc();
-                                return Err(e);
+                                match &e {
+                                    PacketError::Parser(_) => {
+                                        tracing::warn!(error = %e, "handle_packet failed");
+                                        metrics.parser_errors_total.inc();
+                                    }
+                                    PacketError::Publish(_) => {
+                                        tracing::warn!(error = %e, "handle_packet failed");
+                                    }
+                                }
+                                return Err(anyhow::anyhow!("{e}"));
                             }
                         }
                     }
@@ -726,19 +733,33 @@ async fn run_room_inner(
     }
 }
 
+enum PacketError {
+    Parser(anyhow::Error),
+    Publish(anyhow::Error),
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketError::Parser(e) => write!(f, "parser: {e}"),
+            PacketError::Publish(e) => write!(f, "publish: {e}"),
+        }
+    }
+}
+
 async fn handle_packet(
     room_id: u64,
     pkt: &ParsedPacket,
     producer: &RedpandaProducer,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
-) -> Result<()> {
+) -> std::result::Result<(), PacketError> {
     match pkt.op {
         protocol::OP_MESSAGE => {
             let inner_packets = match pkt.protover {
                 protocol::PROTOVER_PLAIN => vec![pkt.clone()],
                 protocol::PROTOVER_DEFLATE | protocol::PROTOVER_BROTLI => {
                     let decompressed = protocol::decompress_body(pkt.protover, &pkt.body)
-                        .map_err(|e| anyhow::anyhow!("decompress: {e}"))?;
+                        .map_err(|e| PacketError::Parser(anyhow::anyhow!("decompress: {e}")))?;
                     protocol::parse_packets(&decompressed)
                 }
                 _ => return Ok(()),
@@ -751,11 +772,15 @@ async fn handle_packet(
                 for msg in messages {
                     match protocol::parse_event(&msg) {
                         LiveEvent::Danmaku(ev) => {
-                            publish_danmaku_with_retry(room_id, producer, metrics, &ev).await?;
+                            publish_danmaku_with_retry(room_id, producer, metrics, &ev)
+                                .await
+                                .map_err(PacketError::Publish)?;
                             metrics.events_total.with_label_values(&["danmaku"]).inc();
                         }
                         LiveEvent::Gift(ev) => {
-                            publish_gift_with_retry(room_id, producer, metrics, &ev).await?;
+                            publish_gift_with_retry(room_id, producer, metrics, &ev)
+                                .await
+                                .map_err(PacketError::Publish)?;
                             metrics.events_total.with_label_values(&["gift"]).inc();
                         }
                         LiveEvent::Malformed { command } => {
