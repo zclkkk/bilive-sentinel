@@ -149,6 +149,9 @@ async fn multi_room_publish_and_consume() {
                                 command_type: wrapper.event.command_type,
                                 parser_version: wrapper.event.parser_version,
                                 received_at: wrapper.received_at,
+                                source_topic: msg.topic().to_string(),
+                                source_partition: msg.partition(),
+                                source_offset: msg.offset(),
                             });
                         }
                     }
@@ -170,6 +173,9 @@ async fn multi_room_publish_and_consume() {
                                 command_type: wrapper.event.command_type,
                                 parser_version: wrapper.event.parser_version,
                                 received_at: wrapper.received_at,
+                                source_topic: msg.topic().to_string(),
+                                source_partition: msg.partition(),
+                                source_offset: msg.offset(),
                             });
                         }
                     }

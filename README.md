@@ -222,6 +222,9 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | command_type | String | 原始命令类型 |
 | parser_version | UInt32 | 解析器版本 |
 | received_at | UInt64 | collector 接收时间 |
+| source_topic | String | Redpanda topic 名称 |
+| source_partition | Int32 | Redpanda partition 编号 |
+| source_offset | Int64 | Redpanda 消息 offset |
 
 **bilibili_live_gifts**
 
@@ -239,6 +242,9 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | command_type | String | 原始命令类型 |
 | parser_version | UInt32 | 解析器版本 |
 | received_at | UInt64 | collector 接收时间 |
+| source_topic | String | Redpanda topic 名称 |
+| source_partition | Int32 | Redpanda partition 编号 |
+| source_offset | Int64 | Redpanda 消息 offset |
 
 ### PostgreSQL 表
 

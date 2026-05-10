@@ -11,6 +11,9 @@ pub struct DanmakuRow {
     pub command_type: String,
     pub parser_version: u32,
     pub received_at: u64,
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
@@ -27,6 +30,9 @@ pub struct GiftRow {
     pub command_type: String,
     pub parser_version: u32,
     pub received_at: u64,
+    pub source_topic: String,
+    pub source_partition: i32,
+    pub source_offset: i64,
 }
 
 pub struct ClickHouseWriter {
@@ -50,7 +56,10 @@ impl ClickHouseWriter {
                     timestamp UInt64,
                     command_type String,
                     parser_version UInt32,
-                    received_at UInt64
+                    received_at UInt64,
+                    source_topic String,
+                    source_partition Int32,
+                    source_offset Int64
                 ) ENGINE = MergeTree() ORDER BY (room_id, timestamp)",
             )
             .execute()
@@ -71,12 +80,32 @@ impl ClickHouseWriter {
                     timestamp UInt64,
                     command_type String,
                     parser_version UInt32,
-                    received_at UInt64
+                    received_at UInt64,
+                    source_topic String,
+                    source_partition Int32,
+                    source_offset Int64
                 ) ENGINE = MergeTree() ORDER BY (room_id, timestamp)",
             )
             .execute()
             .await
             .map_err(|e| e.to_string())?;
+
+        // Migrate existing tables: add source metadata columns if missing
+        for table in &["bilibili_live_danmaku", "bilibili_live_gifts"] {
+            for (col, typ) in &[
+                ("source_topic", "String"),
+                ("source_partition", "Int32"),
+                ("source_offset", "Int64"),
+            ] {
+                self.client
+                    .query(&format!(
+                        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {typ}"
+                    ))
+                    .execute()
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
 
         Ok(())
     }

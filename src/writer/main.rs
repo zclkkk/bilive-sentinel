@@ -94,12 +94,14 @@ async fn main() -> Result<()> {
                     }
                 };
 
+                let consumed_offset = msg.offset();
+
                 match topic.as_str() {
                     DANMAKU_TOPIC => {
                         match serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
                             Ok(wrapper) => {
                                 danmaku_batch.push(
-                                    danmaku_to_row(&wrapper),
+                                    danmaku_to_row(&wrapper, &topic, partition, consumed_offset),
                                     &topic,
                                     partition,
                                     next_offset,
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
                         match serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
                             Ok(wrapper) => {
                                 gift_batch.push(
-                                    gift_to_row(&wrapper),
+                                    gift_to_row(&wrapper, &topic, partition, consumed_offset),
                                     &topic,
                                     partition,
                                     next_offset,
@@ -238,7 +240,12 @@ async fn flush_gifts(
     outcome
 }
 
-fn danmaku_to_row(wrapper: &LiveMessage<DanmakuEvent>) -> DanmakuRow {
+fn danmaku_to_row(
+    wrapper: &LiveMessage<DanmakuEvent>,
+    source_topic: &str,
+    source_partition: i32,
+    source_offset: i64,
+) -> DanmakuRow {
     DanmakuRow {
         room_id: wrapper.room_id,
         uid: wrapper.event.uid,
@@ -248,10 +255,18 @@ fn danmaku_to_row(wrapper: &LiveMessage<DanmakuEvent>) -> DanmakuRow {
         command_type: wrapper.event.command_type.clone(),
         parser_version: wrapper.event.parser_version,
         received_at: wrapper.received_at,
+        source_topic: source_topic.to_string(),
+        source_partition,
+        source_offset,
     }
 }
 
-fn gift_to_row(wrapper: &LiveMessage<GiftEvent>) -> GiftRow {
+fn gift_to_row(
+    wrapper: &LiveMessage<GiftEvent>,
+    source_topic: &str,
+    source_partition: i32,
+    source_offset: i64,
+) -> GiftRow {
     GiftRow {
         room_id: wrapper.room_id,
         uid: wrapper.event.uid,
@@ -265,5 +280,8 @@ fn gift_to_row(wrapper: &LiveMessage<GiftEvent>) -> GiftRow {
         command_type: wrapper.event.command_type.clone(),
         parser_version: wrapper.event.parser_version,
         received_at: wrapper.received_at,
+        source_topic: source_topic.to_string(),
+        source_partition,
+        source_offset,
     }
 }
