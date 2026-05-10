@@ -89,11 +89,8 @@ async fn main() -> Result<()> {
                 let payload = match msg.payload() {
                     Some(p) => p,
                     None => {
-                        tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, committing offset to skip");
-                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                        if let Err(e) = consumer.commit(&msg) {
-                            tracing::warn!(error = %e, "commit empty payload offset failed");
-                        }
+                        tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, skipping");
+                        skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
                         continue;
                     }
                 };
@@ -112,11 +109,8 @@ async fn main() -> Result<()> {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, topic, "bad danmaku payload, committing offset to skip");
-                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                                if let Err(commit_err) = consumer.commit(&msg) {
-                                    tracing::warn!(error = %commit_err, "commit bad payload offset failed");
-                                }
+                                tracing::warn!(error = %e, topic, "bad danmaku payload, skipping");
+                                skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
                             }
                         }
                     }
@@ -131,11 +125,8 @@ async fn main() -> Result<()> {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, topic, "bad gift payload, committing offset to skip");
-                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                                if let Err(commit_err) = consumer.commit(&msg) {
-                                    tracing::warn!(error = %commit_err, "commit bad payload offset failed");
-                                }
+                                tracing::warn!(error = %e, topic, "bad gift payload, skipping");
+                                skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
                             }
                         }
                     }
@@ -163,6 +154,27 @@ async fn main() -> Result<()> {
                 report_lag(&consumer, &writer_metrics);
             }
         }
+    }
+}
+
+fn skip_bad_message(
+    consumer: &RedpandaConsumer,
+    metrics: &bilive_sentinel::metrics::WriterMetrics,
+    topic: &str,
+    msg: &rdkafka::message::OwnedMessage,
+) {
+    metrics.bad_messages_total.with_label_values(&[topic]).inc();
+    if let Err(e) = consumer.commit(msg) {
+        tracing::warn!(error = %e, topic, "commit bad message offset failed");
+        let table = match topic {
+            DANMAKU_TOPIC => "danmaku",
+            GIFT_TOPIC => "gifts",
+            _ => "unknown",
+        };
+        metrics
+            .commit_errors_total
+            .with_label_values(&[table])
+            .inc();
     }
 }
 
