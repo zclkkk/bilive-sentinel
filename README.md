@@ -199,6 +199,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | `bilive_batch_size` | Histogram | — | 写入批次大小 |
 | `bilive_insert_latency_seconds` | Histogram | — | ClickHouse 写入耗时 |
 | `bilive_consumer_lag` | Gauge | `topic` | Redpanda 消费延迟 |
+| `bilive_bad_messages_total` | Counter | `topic` | 无法反序列化的消息数（已提交 offset 跳过） |
 
 ### 全局
 

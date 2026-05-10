@@ -18,6 +18,7 @@ pub struct WriterMetrics {
     pub batch_size: Histogram,
     pub insert_latency: Histogram,
     pub consumer_lag: GaugeVec,
+    pub bad_messages_total: IntCounterVec,
 }
 
 impl CollectorMetrics {
@@ -106,6 +107,15 @@ impl WriterMetrics {
         )
         .unwrap();
 
+        let bad_messages_total = IntCounterVec::new(
+            Opts::new(
+                "bilive_bad_messages_total",
+                "Total messages that could not be deserialized",
+            ),
+            &["topic"],
+        )
+        .unwrap();
+
         registry.register(Box::new(inserts_total.clone())).unwrap();
         registry
             .register(Box::new(commit_errors_total.clone()))
@@ -113,6 +123,9 @@ impl WriterMetrics {
         registry.register(Box::new(batch_size.clone())).unwrap();
         registry.register(Box::new(insert_latency.clone())).unwrap();
         registry.register(Box::new(consumer_lag.clone())).unwrap();
+        registry
+            .register(Box::new(bad_messages_total.clone()))
+            .unwrap();
 
         Self {
             inserts_total,
@@ -120,6 +133,7 @@ impl WriterMetrics {
             batch_size,
             insert_latency,
             consumer_lag,
+            bad_messages_total,
         }
     }
 }

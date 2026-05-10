@@ -89,7 +89,11 @@ async fn main() -> Result<()> {
                 let payload = match msg.payload() {
                     Some(p) => p,
                     None => {
-                        tracing::warn!("received message with no payload, skipping");
+                        tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, committing offset to skip");
+                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                        if let Err(e) = consumer.commit(&msg) {
+                            tracing::warn!(error = %e, "commit empty payload offset failed");
+                        }
                         continue;
                     }
                 };
@@ -108,7 +112,11 @@ async fn main() -> Result<()> {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "failed to deserialize danmaku payload");
+                                tracing::warn!(error = %e, topic, "bad danmaku payload, committing offset to skip");
+                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                                if let Err(commit_err) = consumer.commit(&msg) {
+                                    tracing::warn!(error = %commit_err, "commit bad payload offset failed");
+                                }
                             }
                         }
                     }
@@ -123,7 +131,11 @@ async fn main() -> Result<()> {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "failed to deserialize gift payload");
+                                tracing::warn!(error = %e, topic, "bad gift payload, committing offset to skip");
+                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                                if let Err(commit_err) = consumer.commit(&msg) {
+                                    tracing::warn!(error = %commit_err, "commit bad payload offset failed");
+                                }
                             }
                         }
                     }
