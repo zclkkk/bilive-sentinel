@@ -86,6 +86,9 @@ async fn add_room(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddRoomRequest>,
 ) -> impl IntoResponse {
+    if req.room_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "room_id must be positive").into_response();
+    }
     match bilive_sentinel::registry::add_room(&state.pool, req.room_id).await {
         Ok(room) => (
             StatusCode::CREATED,
@@ -123,8 +126,12 @@ async fn enable_room(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<i64>,
 ) -> impl IntoResponse {
+    if room_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "room_id must be positive").into_response();
+    }
     match bilive_sentinel::registry::set_room_enabled(&state.pool, room_id, true).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -133,8 +140,12 @@ async fn disable_room(
     State(state): State<Arc<AppState>>,
     Path(room_id): Path<i64>,
 ) -> impl IntoResponse {
+    if room_id <= 0 {
+        return (StatusCode::BAD_REQUEST, "room_id must be positive").into_response();
+    }
     match bilive_sentinel::registry::set_room_enabled(&state.pool, room_id, false).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

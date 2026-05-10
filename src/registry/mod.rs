@@ -77,13 +77,14 @@ pub async fn set_room_enabled(
     pool: &PgPool,
     room_id: i64,
     enabled: bool,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE rooms SET enabled = $2, updated_at = NOW() WHERE room_id = $1")
-        .bind(room_id)
-        .bind(enabled)
-        .execute(&mut *tx)
-        .await?;
+    let result =
+        sqlx::query("UPDATE rooms SET enabled = $2, updated_at = NOW() WHERE room_id = $1")
+            .bind(room_id)
+            .bind(enabled)
+            .execute(&mut *tx)
+            .await?;
     if !enabled {
         sqlx::query("DELETE FROM worker_leases WHERE room_id = $1")
             .bind(room_id)
@@ -91,7 +92,7 @@ pub async fn set_room_enabled(
             .await?;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn mark_room_connected(pool: &PgPool, room_id: i64) -> Result<(), sqlx::Error> {
@@ -447,5 +448,22 @@ mod tests {
         release_all_leases(&pool, "worker-1").await.unwrap();
         let leases = list_leases(&pool).await.unwrap();
         assert!(leases.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_room_enabled_nonexistent_returns_false() {
+        let pool = test_pool().await;
+        assert!(!set_room_enabled(&pool, 999999, true).await.unwrap());
+        assert!(!set_room_enabled(&pool, 999999, false).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_room_enabled_existing_returns_true() {
+        let pool = test_pool().await;
+        add_room(&pool, 700).await.unwrap();
+        assert!(set_room_enabled(&pool, 700, false).await.unwrap());
+        assert!(set_room_enabled(&pool, 700, true).await.unwrap());
     }
 }
