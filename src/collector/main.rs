@@ -196,23 +196,25 @@ async fn run_registry_mode(
         let room_id = lease.room_id as u64;
         let ep_semaphore = endpoint_semaphore.clone();
         let metrics = metrics.clone();
+        let pool = pool.clone();
+        let worker_id = worker_id.clone();
 
         join_set.spawn(async move {
             let mut retries: u32 = 0;
+            let mut cached_auth: Option<LiveAuth> = None;
             loop {
-                match client.fetch_live_auth(room_id).await {
-                    Ok(auth) => match run_room(&auth, &producer, &ep_semaphore, &metrics).await {
-                        Ok(()) => {
-                            tracing::info!(room_id, "room closed normally");
-                            break;
-                        }
+                // Fetch auth only if we don't have a cached one
+                let auth = match cached_auth.take() {
+                    Some(auth) => auth,
+                    None => match client.fetch_live_auth(room_id).await {
+                        Ok(auth) => auth,
                         Err(e) => {
                             retries += 1;
                             metrics.reconnects_total.inc();
                             if retries > max_retries {
                                 tracing::warn!(
                                     room_id, retries, error = %e,
-                                    "max retries exceeded, giving up"
+                                    "max retries exceeded after auth failure"
                                 );
                                 break;
                             }
@@ -227,20 +229,33 @@ async fn run_registry_mode(
                             );
                             tracing::warn!(
                                 room_id, retries, delay_ms = delay.as_millis() as u64,
-                                error = %e, "room disconnected, reconnecting"
+                                error = %e, "auth failed, retrying"
                             );
                             tokio::time::sleep(delay).await;
+                            continue;
                         }
                     },
+                };
+
+                match run_room(&auth, &producer, &ep_semaphore, &metrics).await {
+                    Ok(()) => {
+                        tracing::info!(room_id, "room closed normally");
+                        break;
+                    }
                     Err(e) => {
+                        let msg = e.to_string();
                         retries += 1;
                         metrics.reconnects_total.inc();
                         if retries > max_retries {
                             tracing::warn!(
                                 room_id, retries, error = %e,
-                                "max retries exceeded after auth failure"
+                                "max retries exceeded, giving up"
                             );
                             break;
+                        }
+                        // Reuse auth on network errors; invalidate on auth/endpoint errors
+                        if !msg.contains("no endpoints") {
+                            cached_auth = Some(auth);
                         }
                         let delay = bilive_sentinel::backoff::calculate_backoff(
                             base_ms,
@@ -253,11 +268,17 @@ async fn run_registry_mode(
                         );
                         tracing::warn!(
                             room_id, retries, delay_ms = delay.as_millis() as u64,
-                            error = %e, "auth failed, retrying"
+                            error = %e, "room disconnected, reconnecting"
                         );
                         tokio::time::sleep(delay).await;
                     }
                 }
+            }
+            // Release lease when task exits
+            if let Err(e) =
+                bilive_sentinel::registry::release_lease(&pool, room_id as i64, &worker_id).await
+            {
+                tracing::warn!(room_id, error = %e, "release lease failed");
             }
         });
     }
@@ -420,30 +441,36 @@ async fn handle_packet(
 ) -> Result<()> {
     match pkt.op {
         protocol::OP_MESSAGE => {
-            let body = match pkt.protover {
-                protocol::PROTOVER_PLAIN => pkt.body.clone(),
+            let inner_packets = match pkt.protover {
+                protocol::PROTOVER_PLAIN => vec![pkt.clone()],
                 protocol::PROTOVER_DEFLATE | protocol::PROTOVER_BROTLI => {
-                    protocol::decompress_body(pkt.protover, &pkt.body)
-                        .map_err(|e| anyhow::anyhow!("decompress: {e}"))?
+                    let decompressed = protocol::decompress_body(pkt.protover, &pkt.body)
+                        .map_err(|e| anyhow::anyhow!("decompress: {e}"))?;
+                    protocol::parse_packets(&decompressed)
                 }
                 _ => return Ok(()),
             };
-            let messages = protocol::extract_json_messages(&body);
-            for msg in messages {
-                match protocol::parse_event(&msg) {
-                    LiveEvent::Danmaku(ev) => {
-                        metrics.events_total.with_label_values(&["danmaku"]).inc();
-                        if let Err(e) = producer.publish_danmaku(room_id, &ev).await {
-                            tracing::warn!(error = %e, "publish danmaku failed");
+            for inner in &inner_packets {
+                if inner.op != protocol::OP_MESSAGE {
+                    continue;
+                }
+                let messages = protocol::extract_json_messages(&inner.body);
+                for msg in messages {
+                    match protocol::parse_event(&msg) {
+                        LiveEvent::Danmaku(ev) => {
+                            metrics.events_total.with_label_values(&["danmaku"]).inc();
+                            if let Err(e) = producer.publish_danmaku(room_id, &ev).await {
+                                tracing::warn!(error = %e, "publish danmaku failed");
+                            }
                         }
-                    }
-                    LiveEvent::Gift(ev) => {
-                        metrics.events_total.with_label_values(&["gift"]).inc();
-                        if let Err(e) = producer.publish_gift(room_id, &ev).await {
-                            tracing::warn!(error = %e, "publish gift failed");
+                        LiveEvent::Gift(ev) => {
+                            metrics.events_total.with_label_values(&["gift"]).inc();
+                            if let Err(e) = producer.publish_gift(room_id, &ev).await {
+                                tracing::warn!(error = %e, "publish gift failed");
+                            }
                         }
+                        LiveEvent::Unsupported { .. } => {}
                     }
-                    LiveEvent::Unsupported { .. } => {}
                 }
             }
         }
