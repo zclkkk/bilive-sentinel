@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 pub mod clickhouse;
 pub mod live_api;
+pub mod metrics;
 pub mod protocol;
 pub mod redpanda;
 pub mod registry;

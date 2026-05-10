@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
     tracing::info!("writer starting");
 
     let registry = new_service_registry();
+    let writer_metrics = bilive_sentinel::metrics::WriterMetrics::register(&registry);
     let metrics_addr = config.writer.metrics_addr.clone();
     tokio::spawn(async move {
         if let Err(e) = start_metrics_server(&metrics_addr, registry).await {
@@ -99,18 +100,18 @@ async fn main() -> Result<()> {
                 }
 
                 if danmaku_buf.len() >= BATCH_SIZE {
-                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg).await;
+                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg, &writer_metrics).await;
                 }
                 if gift_buf.len() >= BATCH_SIZE {
-                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg).await;
+                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
                 }
             }
             _ = flush_interval.tick() => {
                 if !danmaku_buf.is_empty() {
-                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg).await;
+                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg, &writer_metrics).await;
                 }
                 if !gift_buf.is_empty() {
-                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg).await;
+                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
                 }
             }
         }
@@ -122,7 +123,9 @@ async fn flush_danmaku(
     consumer: &RedpandaConsumer,
     buf: &mut Vec<DanmakuRow>,
     last_msg: &mut Option<OwnedMessage>,
+    metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) {
+    metrics.batch_size.observe(buf.len() as f64);
     let insert_result = ch.insert_danmaku(buf).await.map_err(|e| e.to_string());
     let msg_ref = last_msg.as_ref();
     let outcome = try_flush(buf, insert_result, || {
@@ -133,6 +136,7 @@ async fn flush_danmaku(
         }
     });
     if matches!(outcome, FlushOutcome::Committed) {
+        metrics.inserts_total.with_label_values(&["danmaku"]).inc();
         last_msg.take();
     }
 }
@@ -142,7 +146,9 @@ async fn flush_gifts(
     consumer: &RedpandaConsumer,
     buf: &mut Vec<GiftRow>,
     last_msg: &mut Option<OwnedMessage>,
+    metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) {
+    metrics.batch_size.observe(buf.len() as f64);
     let insert_result = ch.insert_gifts(buf).await.map_err(|e| e.to_string());
     let msg_ref = last_msg.as_ref();
     let outcome = try_flush(buf, insert_result, || {
@@ -153,6 +159,7 @@ async fn flush_gifts(
         }
     });
     if matches!(outcome, FlushOutcome::Committed) {
+        metrics.inserts_total.with_label_values(&["gifts"]).inc();
         last_msg.take();
     }
 }

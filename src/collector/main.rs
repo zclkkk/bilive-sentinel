@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     tracing::info!("collector starting");
 
     let registry = new_service_registry();
+    let collector_metrics = bilive_sentinel::metrics::CollectorMetrics::register(&registry);
     let metrics_addr = config.collector.metrics_addr.clone();
     tokio::spawn(async move {
         if let Err(e) = start_metrics_server(&metrics_addr, registry).await {
@@ -56,9 +57,9 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("ensure_topics: {e}"))?;
 
     if let Some(room_id) = cli.room_id {
-        run_single_room(&config, room_id).await
+        run_single_room(&config, room_id, collector_metrics).await
     } else {
-        run_registry_mode(&config, cli.capacity).await
+        run_registry_mode(&config, cli.capacity, collector_metrics).await
     }
 }
 
@@ -126,7 +127,11 @@ async fn run_lease_only(config: &Config, capacity: usize) -> Result<()> {
     Ok(())
 }
 
-async fn run_single_room(config: &Config, room_id: u64) -> Result<()> {
+async fn run_single_room(
+    config: &Config,
+    room_id: u64,
+    metrics: bilive_sentinel::metrics::CollectorMetrics,
+) -> Result<()> {
     let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
     let client = bilive_sentinel::live_api::LiveApiClient::new();
 
@@ -137,13 +142,17 @@ async fn run_single_room(config: &Config, room_id: u64) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("fetch_live_auth: {e}"))?;
 
     tracing::info!(room_id = auth.room_id, "connecting to room");
-    run_room(&auth, &producer).await?;
+    run_room(&auth, &producer, &metrics).await?;
 
     tracing::info!("collector shutting down");
     Ok(())
 }
 
-async fn run_registry_mode(config: &Config, capacity: usize) -> Result<()> {
+async fn run_registry_mode(
+    config: &Config,
+    capacity: usize,
+    metrics: bilive_sentinel::metrics::CollectorMetrics,
+) -> Result<()> {
     let pool = sqlx::PgPool::connect(&config.postgres.url)
         .await
         .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
@@ -172,10 +181,11 @@ async fn run_registry_mode(config: &Config, capacity: usize) -> Result<()> {
         let client = client.clone();
         let room_id = lease.room_id as u64;
 
+        let metrics = metrics.clone();
         join_set.spawn(async move {
             match client.fetch_live_auth(room_id).await {
                 Ok(auth) => {
-                    if let Err(e) = run_room(&auth, &producer).await {
+                    if let Err(e) = run_room(&auth, &producer, &metrics).await {
                         tracing::warn!(room_id, error = %e, "room failed");
                     }
                 }
@@ -248,7 +258,12 @@ async fn check_live_auth(room_id: u64) -> Result<()> {
     Ok(())
 }
 
-async fn run_room(auth: &LiveAuth, producer: &RedpandaProducer) -> Result<()> {
+async fn run_room(
+    auth: &LiveAuth,
+    producer: &RedpandaProducer,
+    metrics: &bilive_sentinel::metrics::CollectorMetrics,
+) -> Result<()> {
+    metrics.active_rooms.inc();
     let endpoint = auth
         .endpoints
         .first()
@@ -294,8 +309,9 @@ async fn run_room(auth: &LiveAuth, producer: &RedpandaProducer) -> Result<()> {
             Message::Binary(data) => {
                 let packets = protocol::parse_packets(&data);
                 for pkt in packets {
-                    if let Err(e) = handle_packet(room_id, &pkt, producer).await {
+                    if let Err(e) = handle_packet(room_id, &pkt, producer, metrics).await {
                         tracing::warn!(error = %e, "handle_packet failed");
+                        metrics.parser_errors_total.inc();
                     }
                 }
             }
@@ -305,6 +321,7 @@ async fn run_room(auth: &LiveAuth, producer: &RedpandaProducer) -> Result<()> {
     }
 
     heartbeat_handle.abort();
+    metrics.active_rooms.dec();
     Ok(())
 }
 
@@ -312,6 +329,7 @@ async fn handle_packet(
     room_id: u64,
     pkt: &ParsedPacket,
     producer: &RedpandaProducer,
+    metrics: &bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     match pkt.op {
         protocol::OP_MESSAGE => {
@@ -327,11 +345,13 @@ async fn handle_packet(
             for msg in messages {
                 match protocol::parse_event(&msg) {
                     LiveEvent::Danmaku(ev) => {
+                        metrics.events_total.with_label_values(&["danmaku"]).inc();
                         if let Err(e) = producer.publish_danmaku(room_id, &ev).await {
                             tracing::warn!(error = %e, "publish danmaku failed");
                         }
                     }
                     LiveEvent::Gift(ev) => {
+                        metrics.events_total.with_label_values(&["gift"]).inc();
                         if let Err(e) = producer.publish_gift(room_id, &ev).await {
                             tracing::warn!(error = %e, "publish gift failed");
                         }
