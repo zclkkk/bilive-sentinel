@@ -1,0 +1,21 @@
+[log]
+level = "info"
+
+[collector]
+metrics_addr = "0.0.0.0:9100"
+
+[writer]
+metrics_addr = "0.0.0.0:9101"
+
+[api]
+listen_addr = "0.0.0.0:8080"
+metrics_addr = "0.0.0.0:9102"
+
+[postgres]
+url = "postgres://bilive:bilive@localhost:5432/bilive"
+
+[clickhouse]
+url = "http://localhost:8123"
+
+[redpanda]
+bootstrap_servers = "localhost:9092"

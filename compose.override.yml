@@ -1,0 +1,15 @@
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redpanda:
+    ports:
+      - "9092:9092"
+      - "8082:8082"
+      - "9644:9644"
+
+  clickhouse:
+    ports:
+      - "8123:8123"
+      - "9000:9000"
