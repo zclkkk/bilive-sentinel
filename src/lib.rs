@@ -6,6 +6,7 @@ pub mod clickhouse;
 pub mod live_api;
 pub mod protocol;
 pub mod redpanda;
+pub mod registry;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {

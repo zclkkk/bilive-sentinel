@@ -3,6 +3,7 @@ use super::{LiveApi, LiveApiError, LiveAuth, LiveEndpoint};
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+#[derive(Clone)]
 pub struct LiveApiClient {
     http: reqwest::Client,
 }

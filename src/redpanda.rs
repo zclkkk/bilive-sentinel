@@ -16,6 +16,7 @@ pub struct LiveMessage<T> {
     pub received_at: u64,
 }
 
+#[derive(Clone)]
 pub struct RedpandaProducer {
     producer: FutureProducer,
 }

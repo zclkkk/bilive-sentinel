@@ -18,6 +18,9 @@ struct Cli {
 
     #[arg(long)]
     check_live_auth: Option<u64>,
+
+    #[arg(long, default_value = "100")]
+    capacity: usize,
 }
 
 #[tokio::main]
@@ -41,26 +44,112 @@ async fn main() -> Result<()> {
         }
     });
 
+    bilive_sentinel::redpanda::ensure_topics(&config.redpanda.bootstrap_servers)
+        .await
+        .map_err(|e| anyhow::anyhow!("ensure_topics: {e}"))?;
+
     if let Some(room_id) = cli.room_id {
-        bilive_sentinel::redpanda::ensure_topics(&config.redpanda.bootstrap_servers)
-            .await
-            .map_err(|e| anyhow::anyhow!("ensure_topics: {e}"))?;
-
-        let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
-        let client = bilive_sentinel::live_api::LiveApiClient::new();
-
-        tracing::info!(room_id, "fetching live auth");
-        let auth = client
-            .fetch_live_auth(room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("fetch_live_auth: {e}"))?;
-
-        tracing::info!(room_id = auth.room_id, "connecting to room");
-        run_room(&auth, &producer).await?;
+        run_single_room(&config, room_id).await
     } else {
-        tracing::info!("no --room-id provided, waiting for shutdown");
-        tokio::signal::ctrl_c().await?;
+        run_registry_mode(&config, cli.capacity).await
     }
+}
+
+async fn run_single_room(config: &Config, room_id: u64) -> Result<()> {
+    let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
+    let client = bilive_sentinel::live_api::LiveApiClient::new();
+
+    tracing::info!(room_id, "fetching live auth");
+    let auth = client
+        .fetch_live_auth(room_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch_live_auth: {e}"))?;
+
+    tracing::info!(room_id = auth.room_id, "connecting to room");
+    run_room(&auth, &producer).await?;
+
+    tracing::info!("collector shutting down");
+    Ok(())
+}
+
+async fn run_registry_mode(config: &Config, capacity: usize) -> Result<()> {
+    let pool = sqlx::PgPool::connect(&config.postgres.url)
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
+
+    bilive_sentinel::registry::create_tables(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("create_tables: {e}"))?;
+
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let lease_ttl = chrono::Duration::seconds(60);
+
+    tracing::info!(worker_id, capacity, "claiming rooms");
+    let leases =
+        bilive_sentinel::registry::claim_available_rooms(&pool, &worker_id, capacity, lease_ttl)
+            .await
+            .map_err(|e| anyhow::anyhow!("claim_available_rooms: {e}"))?;
+
+    tracing::info!(count = leases.len(), "claimed rooms");
+
+    let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
+    let client = bilive_sentinel::live_api::LiveApiClient::new();
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for lease in leases {
+        let producer = producer.clone();
+        let client = client.clone();
+        let room_id = lease.room_id as u64;
+
+        join_set.spawn(async move {
+            match client.fetch_live_auth(room_id).await {
+                Ok(auth) => {
+                    if let Err(e) = run_room(&auth, &producer).await {
+                        tracing::warn!(room_id, error = %e, "room failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(room_id, error = %e, "fetch_live_auth failed");
+                }
+            }
+        });
+    }
+
+    // Spawn lease renewal task
+    let pool_clone = pool.clone();
+    let worker_id_clone = worker_id.clone();
+    let renewal_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let leases = bilive_sentinel::registry::list_leases(&pool_clone)
+                .await
+                .unwrap_or_default();
+            for lease in leases.iter().filter(|l| l.worker_id == worker_id_clone) {
+                if let Err(e) = bilive_sentinel::registry::renew_lease(
+                    &pool_clone,
+                    lease.room_id,
+                    &worker_id_clone,
+                    chrono::Duration::seconds(60),
+                )
+                .await
+                {
+                    tracing::warn!(room_id = lease.room_id, error = %e, "renew lease failed");
+                }
+            }
+        }
+    });
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+
+    // Shutdown: release leases and abort tasks
+    tracing::info!("shutting down, releasing leases");
+    renewal_handle.abort();
+    bilive_sentinel::registry::release_all_leases(&pool, &worker_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("release_all_leases: {e}"))?;
+    join_set.abort_all();
 
     tracing::info!("collector shutting down");
     Ok(())
