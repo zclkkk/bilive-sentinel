@@ -21,6 +21,9 @@ struct Cli {
 
     #[arg(long, default_value = "100")]
     capacity: usize,
+
+    #[arg(long)]
+    lease_only: bool,
 }
 
 #[tokio::main]
@@ -44,6 +47,10 @@ async fn main() -> Result<()> {
         }
     });
 
+    if cli.lease_only {
+        return run_lease_only(&config, cli.capacity).await;
+    }
+
     bilive_sentinel::redpanda::ensure_topics(&config.redpanda.bootstrap_servers)
         .await
         .map_err(|e| anyhow::anyhow!("ensure_topics: {e}"))?;
@@ -53,6 +60,70 @@ async fn main() -> Result<()> {
     } else {
         run_registry_mode(&config, cli.capacity).await
     }
+}
+
+async fn run_lease_only(config: &Config, capacity: usize) -> Result<()> {
+    let pool = sqlx::PgPool::connect(&config.postgres.url)
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
+
+    bilive_sentinel::registry::create_tables(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("create_tables: {e}"))?;
+
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let lease_ttl = chrono::Duration::seconds(60);
+
+    tracing::info!(worker_id, capacity, "claiming rooms (lease-only mode)");
+    let leases =
+        bilive_sentinel::registry::claim_available_rooms(&pool, &worker_id, capacity, lease_ttl)
+            .await
+            .map_err(|e| anyhow::anyhow!("claim_available_rooms: {e}"))?;
+
+    for lease in &leases {
+        tracing::info!(
+            room_id = lease.room_id,
+            worker_id = lease.worker_id,
+            "claimed room"
+        );
+    }
+    tracing::info!(count = leases.len(), "total rooms claimed");
+
+    // Renewal loop
+    let pool_clone = pool.clone();
+    let worker_id_clone = worker_id.clone();
+    let renewal_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let leases = bilive_sentinel::registry::list_leases(&pool_clone)
+                .await
+                .unwrap_or_default();
+            for lease in leases.iter().filter(|l| l.worker_id == worker_id_clone) {
+                if let Err(e) = bilive_sentinel::registry::renew_lease(
+                    &pool_clone,
+                    lease.room_id,
+                    &worker_id_clone,
+                    chrono::Duration::seconds(60),
+                )
+                .await
+                {
+                    tracing::warn!(room_id = lease.room_id, error = %e, "renew lease failed");
+                }
+            }
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("shutting down, releasing leases");
+    renewal_handle.abort();
+    bilive_sentinel::registry::release_all_leases(&pool, &worker_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("release_all_leases: {e}"))?;
+
+    tracing::info!("collector shutting down (lease-only mode)");
+    Ok(())
 }
 
 async fn run_single_room(config: &Config, room_id: u64) -> Result<()> {
