@@ -4,6 +4,7 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub const DANMAKU_TOPIC: &str = "bilibili.live.danmaku.v1";
@@ -119,6 +120,33 @@ impl RedpandaConsumer {
         self.consumer
             .commit(&tpl, rdkafka::consumer::CommitMode::Async)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn report_lag(&self) -> Result<HashMap<String, i64>, String> {
+        let position = self.consumer.position().map_err(|e| e.to_string())?;
+        let committed = self
+            .consumer
+            .committed(Duration::from_secs(1))
+            .map_err(|e| e.to_string())?;
+
+        let mut lag_map: HashMap<String, i64> = HashMap::new();
+        for pos_elem in position.elements() {
+            let pos_offset = match pos_elem.offset() {
+                rdkafka::Offset::Offset(o) => o,
+                _ => continue,
+            };
+            let commit_offset = committed
+                .elements()
+                .iter()
+                .find(|c| c.topic() == pos_elem.topic() && c.partition() == pos_elem.partition())
+                .and_then(|c| match c.offset() {
+                    rdkafka::Offset::Offset(o) => Some(o),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            *lag_map.entry(pos_elem.topic().to_string()).or_insert(0) += pos_offset - commit_offset;
+        }
+        Ok(lag_map)
     }
 }
 

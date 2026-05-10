@@ -5,6 +5,8 @@ use bilive_sentinel::redpanda::RedpandaProducer;
 use bilive_sentinel::{Config, init_tracing, new_service_registry, start_metrics_server};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -133,7 +135,8 @@ async fn run_single_room(
     metrics: bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
-    let client = bilive_sentinel::live_api::LiveApiClient::new();
+    let client = bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_rate_limit);
+    let ep_semaphore = Arc::new(Semaphore::new(config.collector.endpoint_rate_limit));
 
     tracing::info!(room_id, "fetching live auth");
     let auth = client
@@ -142,7 +145,7 @@ async fn run_single_room(
         .map_err(|e| anyhow::anyhow!("fetch_live_auth: {e}"))?;
 
     tracing::info!(room_id = auth.room_id, "connecting to room");
-    run_room(&auth, &producer, &metrics).await?;
+    run_room(&auth, &producer, &ep_semaphore, &metrics).await?;
 
     tracing::info!("collector shutting down");
     Ok(())
@@ -173,24 +176,84 @@ async fn run_registry_mode(
     tracing::info!(count = leases.len(), "claimed rooms");
 
     let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
-    let client = bilive_sentinel::live_api::LiveApiClient::new();
+    let client = bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_rate_limit);
+    let endpoint_semaphore = Arc::new(Semaphore::new(config.collector.endpoint_rate_limit));
+
+    let base_ms = config.collector.reconnect_base_ms;
+    let max_ms = config.collector.reconnect_max_ms;
+    let max_retries = config.collector.reconnect_max_retries;
+    let startup_delay = config.collector.startup_delay_ms;
 
     let mut join_set = tokio::task::JoinSet::new();
-    for lease in leases {
+    for (i, lease) in leases.into_iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(startup_delay)).await;
+        }
         let producer = producer.clone();
         let client = client.clone();
         let room_id = lease.room_id as u64;
-
+        let ep_semaphore = endpoint_semaphore.clone();
         let metrics = metrics.clone();
+
         join_set.spawn(async move {
-            match client.fetch_live_auth(room_id).await {
-                Ok(auth) => {
-                    if let Err(e) = run_room(&auth, &producer, &metrics).await {
-                        tracing::warn!(room_id, error = %e, "room failed");
+            let mut retries: u32 = 0;
+            loop {
+                match client.fetch_live_auth(room_id).await {
+                    Ok(auth) => match run_room(&auth, &producer, &ep_semaphore, &metrics).await {
+                        Ok(()) => {
+                            tracing::info!(room_id, "room closed normally");
+                            break;
+                        }
+                        Err(e) => {
+                            retries += 1;
+                            metrics.reconnects_total.inc();
+                            if retries > max_retries {
+                                tracing::warn!(
+                                    room_id, retries, error = %e,
+                                    "max retries exceeded, giving up"
+                                );
+                                break;
+                            }
+                            let delay = bilive_sentinel::backoff::calculate_backoff(
+                                base_ms,
+                                max_ms,
+                                retries,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64,
+                            );
+                            tracing::warn!(
+                                room_id, retries, delay_ms = delay.as_millis() as u64,
+                                error = %e, "room disconnected, reconnecting"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                    },
+                    Err(e) => {
+                        retries += 1;
+                        if retries > max_retries {
+                            tracing::warn!(
+                                room_id, retries, error = %e,
+                                "max retries exceeded after auth failure"
+                            );
+                            break;
+                        }
+                        let delay = bilive_sentinel::backoff::calculate_backoff(
+                            base_ms,
+                            max_ms,
+                            retries,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos() as u64,
+                        );
+                        tracing::warn!(
+                            room_id, retries, delay_ms = delay.as_millis() as u64,
+                            error = %e, "auth failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(room_id, error = %e, "fetch_live_auth failed");
                 }
             }
         });
@@ -237,7 +300,7 @@ async fn run_registry_mode(
 }
 
 async fn check_live_auth(room_id: u64) -> Result<()> {
-    let client = bilive_sentinel::live_api::LiveApiClient::new();
+    let client = bilive_sentinel::live_api::LiveApiClient::default();
     match client.fetch_live_auth(room_id).await {
         Ok(auth) => {
             println!("Auth info for room {room_id}:");
@@ -261,10 +324,11 @@ async fn check_live_auth(room_id: u64) -> Result<()> {
 async fn run_room(
     auth: &LiveAuth,
     producer: &RedpandaProducer,
+    endpoint_semaphore: &Arc<Semaphore>,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     metrics.active_rooms.inc();
-    let result = run_room_inner(auth, producer, metrics).await;
+    let result = run_room_inner(auth, producer, endpoint_semaphore, metrics).await;
     metrics.active_rooms.dec();
     result
 }
@@ -272,6 +336,7 @@ async fn run_room(
 async fn run_room_inner(
     auth: &LiveAuth,
     producer: &RedpandaProducer,
+    endpoint_semaphore: &Arc<Semaphore>,
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     let endpoint = auth
@@ -281,6 +346,10 @@ async fn run_room_inner(
     let url = format!("wss://{}:{}/sub", endpoint.host, endpoint.port);
 
     tracing::info!(url, "connecting websocket");
+    let _ep_permit = endpoint_semaphore
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
     let (ws_stream, _) = connect_async(&url).await?;
     let (mut write, mut read) = ws_stream.split();
 

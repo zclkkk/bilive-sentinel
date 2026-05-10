@@ -10,9 +10,6 @@ use clap::Parser;
 use rdkafka::message::{Message, OwnedMessage};
 use std::time::Duration;
 
-const BATCH_SIZE: usize = 100;
-const BATCH_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Parser)]
 struct Cli {
     #[arg(short, long, default_value = "config/default.toml")]
@@ -52,11 +49,15 @@ async fn main() -> Result<()> {
     consumer.subscribe(&[DANMAKU_TOPIC, GIFT_TOPIC]);
     tracing::info!("subscribed to redpanda topics");
 
+    let batch_size = config.writer.batch_size;
+    let batch_timeout = Duration::from_millis(config.writer.batch_timeout_ms);
+
     let mut danmaku_buf: Vec<DanmakuRow> = Vec::new();
     let mut gift_buf: Vec<GiftRow> = Vec::new();
     let mut last_danmaku_msg: Option<OwnedMessage> = None;
     let mut last_gift_msg: Option<OwnedMessage> = None;
-    let mut flush_interval = tokio::time::interval(BATCH_TIMEOUT);
+    let mut flush_interval = tokio::time::interval(batch_timeout);
+    let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
@@ -99,10 +100,10 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                if danmaku_buf.len() >= BATCH_SIZE {
+                if danmaku_buf.len() >= batch_size {
                     flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg, &writer_metrics).await;
                 }
-                if gift_buf.len() >= BATCH_SIZE {
+                if gift_buf.len() >= batch_size {
                     flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
                 }
             }
@@ -112,6 +113,18 @@ async fn main() -> Result<()> {
                 }
                 if !gift_buf.is_empty() {
                     flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
+                }
+            }
+            _ = lag_interval.tick() => {
+                match consumer.report_lag() {
+                    Ok(lag_map) => {
+                        for (topic, lag) in lag_map {
+                            writer_metrics.consumer_lag
+                                .with_label_values(&[&topic])
+                                .set(lag as f64);
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "consumer lag report failed"),
                 }
             }
         }
@@ -126,7 +139,11 @@ async fn flush_danmaku(
     metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) {
     metrics.batch_size.observe(buf.len() as f64);
+    let start = std::time::Instant::now();
     let insert_result = ch.insert_danmaku(buf).await.map_err(|e| e.to_string());
+    metrics
+        .insert_latency
+        .observe(start.elapsed().as_secs_f64());
     let msg_ref = last_msg.as_ref();
     let outcome = try_flush(buf, insert_result, || {
         if let Some(msg) = msg_ref {
@@ -149,7 +166,11 @@ async fn flush_gifts(
     metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) {
     metrics.batch_size.observe(buf.len() as f64);
+    let start = std::time::Instant::now();
     let insert_result = ch.insert_gifts(buf).await.map_err(|e| e.to_string());
+    metrics
+        .insert_latency
+        .observe(start.elapsed().as_secs_f64());
     let msg_ref = last_msg.as_ref();
     let outcome = try_flush(buf, insert_result, || {
         if let Some(msg) = msg_ref {

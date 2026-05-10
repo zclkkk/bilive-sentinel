@@ -1,16 +1,21 @@
-use prometheus::{Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry};
+use prometheus::{
+    Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry,
+};
 
 #[derive(Clone)]
 pub struct CollectorMetrics {
     pub active_rooms: Gauge,
     pub events_total: IntCounterVec,
     pub parser_errors_total: IntCounter,
+    pub reconnects_total: IntCounter,
 }
 
 #[derive(Clone)]
 pub struct WriterMetrics {
     pub inserts_total: IntCounterVec,
     pub batch_size: Histogram,
+    pub insert_latency: Histogram,
+    pub consumer_lag: GaugeVec,
 }
 
 impl CollectorMetrics {
@@ -27,17 +32,26 @@ impl CollectorMetrics {
             "Total parser errors",
         ))
         .unwrap();
+        let reconnects_total = IntCounter::with_opts(Opts::new(
+            "bilive_reconnects_total",
+            "Total reconnection attempts",
+        ))
+        .unwrap();
 
         registry.register(Box::new(active_rooms.clone())).unwrap();
         registry.register(Box::new(events_total.clone())).unwrap();
         registry
             .register(Box::new(parser_errors_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(reconnects_total.clone()))
+            .unwrap();
 
         Self {
             active_rooms,
             events_total,
             parser_errors_total,
+            reconnects_total,
         }
     }
 }
@@ -54,13 +68,35 @@ impl WriterMetrics {
                 .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
         )
         .unwrap();
+        let insert_latency = Histogram::with_opts(
+            HistogramOpts::new(
+                "bilive_insert_latency_seconds",
+                "ClickHouse insert duration",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+            ]),
+        )
+        .unwrap();
+        let consumer_lag = GaugeVec::new(
+            Opts::new(
+                "bilive_consumer_lag",
+                "Redpanda consumer lag (position minus committed offset)",
+            ),
+            &["topic"],
+        )
+        .unwrap();
 
         registry.register(Box::new(inserts_total.clone())).unwrap();
         registry.register(Box::new(batch_size.clone())).unwrap();
+        registry.register(Box::new(insert_latency.clone())).unwrap();
+        registry.register(Box::new(consumer_lag.clone())).unwrap();
 
         Self {
             inserts_total,
             batch_size,
+            insert_latency,
+            consumer_lag,
         }
     }
 }

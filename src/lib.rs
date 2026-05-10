@@ -2,6 +2,7 @@ use anyhow::Result;
 use prometheus::{Encoder, Gauge, Registry, TextEncoder};
 use serde::Deserialize;
 
+pub mod backoff;
 pub mod clickhouse;
 pub mod live_api;
 pub mod metrics;
@@ -25,14 +26,55 @@ pub struct LogConfig {
     pub level: String,
 }
 
+fn default_startup_delay_ms() -> u64 {
+    200
+}
+fn default_api_rate_limit() -> usize {
+    10
+}
+fn default_endpoint_rate_limit() -> usize {
+    20
+}
+fn default_reconnect_base_ms() -> u64 {
+    1000
+}
+fn default_reconnect_max_ms() -> u64 {
+    60000
+}
+fn default_reconnect_max_retries() -> u32 {
+    10
+}
+fn default_batch_size() -> usize {
+    100
+}
+fn default_batch_timeout_ms() -> u64 {
+    5000
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CollectorConfig {
     pub metrics_addr: String,
+    #[serde(default = "default_startup_delay_ms")]
+    pub startup_delay_ms: u64,
+    #[serde(default = "default_api_rate_limit")]
+    pub api_rate_limit: usize,
+    #[serde(default = "default_endpoint_rate_limit")]
+    pub endpoint_rate_limit: usize,
+    #[serde(default = "default_reconnect_base_ms")]
+    pub reconnect_base_ms: u64,
+    #[serde(default = "default_reconnect_max_ms")]
+    pub reconnect_max_ms: u64,
+    #[serde(default = "default_reconnect_max_retries")]
+    pub reconnect_max_retries: u32,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WriterConfig {
     pub metrics_addr: String,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_batch_timeout_ms")]
+    pub batch_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,5 +182,85 @@ bootstrap_servers = "localhost:9092"
         assert_eq!(config.log.level, "info");
         assert_eq!(config.collector.metrics_addr, "0.0.0.0:9100");
         assert_eq!(config.api.listen_addr, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn config_parse_defaults() {
+        let toml_str = r#"
+[log]
+level = "info"
+
+[collector]
+metrics_addr = "0.0.0.0:9100"
+
+[writer]
+metrics_addr = "0.0.0.0:9101"
+
+[api]
+listen_addr = "0.0.0.0:8080"
+metrics_addr = "0.0.0.0:9102"
+
+[postgres]
+url = "postgres://bilive:bilive@localhost:5432/bilive"
+
+[clickhouse]
+url = "http://localhost:8123"
+
+[redpanda]
+bootstrap_servers = "localhost:9092"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.collector.startup_delay_ms, 200);
+        assert_eq!(config.collector.api_rate_limit, 10);
+        assert_eq!(config.collector.endpoint_rate_limit, 20);
+        assert_eq!(config.collector.reconnect_base_ms, 1000);
+        assert_eq!(config.collector.reconnect_max_ms, 60000);
+        assert_eq!(config.collector.reconnect_max_retries, 10);
+        assert_eq!(config.writer.batch_size, 100);
+        assert_eq!(config.writer.batch_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn config_parse_with_scale_fields() {
+        let toml_str = r#"
+[log]
+level = "info"
+
+[collector]
+metrics_addr = "0.0.0.0:9100"
+startup_delay_ms = 500
+api_rate_limit = 5
+endpoint_rate_limit = 15
+reconnect_base_ms = 2000
+reconnect_max_ms = 120000
+reconnect_max_retries = 20
+
+[writer]
+metrics_addr = "0.0.0.0:9101"
+batch_size = 50
+batch_timeout_ms = 2000
+
+[api]
+listen_addr = "0.0.0.0:8080"
+metrics_addr = "0.0.0.0:9102"
+
+[postgres]
+url = "postgres://bilive:bilive@localhost:5432/bilive"
+
+[clickhouse]
+url = "http://localhost:8123"
+
+[redpanda]
+bootstrap_servers = "localhost:9092"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.collector.startup_delay_ms, 500);
+        assert_eq!(config.collector.api_rate_limit, 5);
+        assert_eq!(config.collector.endpoint_rate_limit, 15);
+        assert_eq!(config.collector.reconnect_base_ms, 2000);
+        assert_eq!(config.collector.reconnect_max_ms, 120000);
+        assert_eq!(config.collector.reconnect_max_retries, 20);
+        assert_eq!(config.writer.batch_size, 50);
+        assert_eq!(config.writer.batch_timeout_ms, 2000);
     }
 }

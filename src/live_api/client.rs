@@ -1,26 +1,33 @@
 use super::wbi;
 use super::{LiveApi, LiveApiError, LiveAuth, LiveEndpoint};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 #[derive(Clone)]
 pub struct LiveApiClient {
     http: reqwest::Client,
+    api_semaphore: Arc<Semaphore>,
 }
 
 impl Default for LiveApiClient {
     fn default() -> Self {
-        Self::new()
+        Self::new(10)
     }
 }
 
 impl LiveApiClient {
-    pub fn new() -> Self {
+    pub fn new(api_limit: usize) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .build()
             .expect("client build");
-        Self { http }
+        let api_semaphore = Arc::new(Semaphore::new(api_limit));
+        Self {
+            http,
+            api_semaphore,
+        }
     }
 
     async fn fetch_buvid3(&self) -> Result<String, LiveApiError> {
@@ -106,6 +113,11 @@ impl LiveApi for LiveApiClient {
     }
 
     async fn fetch_live_auth(&self, room_id: u64) -> Result<LiveAuth, LiveApiError> {
+        let _permit = self
+            .api_semaphore
+            .acquire()
+            .await
+            .map_err(|_| LiveApiError::Network("api limiter closed".into()))?;
         let long_room_id = self.resolve_room_id(room_id).await?;
 
         let nav: BiliResponse<NavData> = self

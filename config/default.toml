@@ -3,9 +3,17 @@ level = "info"
 
 [collector]
 metrics_addr = "0.0.0.0:9100"
+startup_delay_ms = 200
+api_rate_limit = 10
+endpoint_rate_limit = 20
+reconnect_base_ms = 1000
+reconnect_max_ms = 60000
+reconnect_max_retries = 10
 
 [writer]
 metrics_addr = "0.0.0.0:9101"
+batch_size = 100
+batch_timeout_ms = 5000
 
 [api]
 listen_addr = "0.0.0.0:8080"
