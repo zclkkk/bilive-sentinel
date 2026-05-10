@@ -1,4 +1,7 @@
+mod batch;
+
 use anyhow::Result;
+use batch::{FlushOutcome, try_flush};
 use bilive_sentinel::clickhouse::{ClickHouseWriter, DanmakuRow, GiftRow};
 use bilive_sentinel::protocol::{DanmakuEvent, GiftEvent};
 use bilive_sentinel::redpanda::{DANMAKU_TOPIC, GIFT_TOPIC, LiveMessage, RedpandaConsumer};
@@ -120,19 +123,17 @@ async fn flush_danmaku(
     buf: &mut Vec<DanmakuRow>,
     last_msg: &mut Option<OwnedMessage>,
 ) {
-    match ch.insert_danmaku(buf).await {
-        Ok(()) => {
-            tracing::debug!(count = buf.len(), "inserted danmaku batch");
-            buf.clear();
-            if let Some(msg) = last_msg.take()
-                && let Err(e) = consumer.commit(&msg)
-            {
-                tracing::warn!(error = %e, "commit danmaku offset failed");
-            }
+    let insert_result = ch.insert_danmaku(buf).await.map_err(|e| e.to_string());
+    let msg_ref = last_msg.as_ref();
+    let outcome = try_flush(buf, insert_result, || {
+        if let Some(msg) = msg_ref {
+            consumer.commit(msg)
+        } else {
+            Ok(())
         }
-        Err(e) => {
-            tracing::warn!(error = %e, count = buf.len(), "insert danmaku failed, keeping batch");
-        }
+    });
+    if matches!(outcome, FlushOutcome::Committed) {
+        last_msg.take();
     }
 }
 
@@ -142,19 +143,17 @@ async fn flush_gifts(
     buf: &mut Vec<GiftRow>,
     last_msg: &mut Option<OwnedMessage>,
 ) {
-    match ch.insert_gifts(buf).await {
-        Ok(()) => {
-            tracing::debug!(count = buf.len(), "inserted gift batch");
-            buf.clear();
-            if let Some(msg) = last_msg.take()
-                && let Err(e) = consumer.commit(&msg)
-            {
-                tracing::warn!(error = %e, "commit gift offset failed");
-            }
+    let insert_result = ch.insert_gifts(buf).await.map_err(|e| e.to_string());
+    let msg_ref = last_msg.as_ref();
+    let outcome = try_flush(buf, insert_result, || {
+        if let Some(msg) = msg_ref {
+            consumer.commit(msg)
+        } else {
+            Ok(())
         }
-        Err(e) => {
-            tracing::warn!(error = %e, count = buf.len(), "insert gifts failed, keeping batch");
-        }
+    });
+    if matches!(outcome, FlushOutcome::Committed) {
+        last_msg.take();
     }
 }
 
