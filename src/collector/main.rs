@@ -264,6 +264,16 @@ async fn run_room(
     metrics: &bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     metrics.active_rooms.inc();
+    let result = run_room_inner(auth, producer, metrics).await;
+    metrics.active_rooms.dec();
+    result
+}
+
+async fn run_room_inner(
+    auth: &LiveAuth,
+    producer: &RedpandaProducer,
+    metrics: &bilive_sentinel::metrics::CollectorMetrics,
+) -> Result<()> {
     let endpoint = auth
         .endpoints
         .first()
@@ -303,26 +313,29 @@ async fn run_room(
 
     // Read loop
     let room_id = auth.room_id;
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
-        match msg {
-            Message::Binary(data) => {
-                let packets = protocol::parse_packets(&data);
-                for pkt in packets {
-                    if let Err(e) = handle_packet(room_id, &pkt, producer, metrics).await {
-                        tracing::warn!(error = %e, "handle_packet failed");
-                        metrics.parser_errors_total.inc();
+    let read_result = async {
+        while let Some(msg) = read.next().await {
+            let msg = msg?;
+            match msg {
+                Message::Binary(data) => {
+                    let packets = protocol::parse_packets(&data);
+                    for pkt in packets {
+                        if let Err(e) = handle_packet(room_id, &pkt, producer, metrics).await {
+                            tracing::warn!(error = %e, "handle_packet failed");
+                            metrics.parser_errors_total.inc();
+                        }
                     }
                 }
+                Message::Close(_) => break,
+                _ => {}
             }
-            Message::Close(_) => break,
-            _ => {}
         }
+        Ok(())
     }
+    .await;
 
     heartbeat_handle.abort();
-    metrics.active_rooms.dec();
-    Ok(())
+    read_result
 }
 
 async fn handle_packet(
