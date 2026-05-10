@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
 
     let batch_size = config.writer.batch_size;
     let batch_timeout = Duration::from_millis(config.writer.batch_timeout_ms);
+    let commit_retry_delay = Duration::from_millis(250);
 
     let mut danmaku_batch: PendingBatch<DanmakuRow> = PendingBatch::new();
     let mut gift_batch: PendingBatch<GiftRow> = PendingBatch::new();
@@ -58,17 +59,23 @@ async fn main() -> Result<()> {
     let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
-        if danmaku_batch.inserted() {
-            let outcome = flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
-            if matches!(outcome, FlushOutcome::CommitFailed) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+        if danmaku_batch.inserted() || gift_batch.inserted() {
+            let mut commit_failed = false;
+            if danmaku_batch.inserted() {
+                let outcome =
+                    flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
+                commit_failed |= matches!(outcome, FlushOutcome::CommitFailed);
             }
-            continue;
-        }
-        if gift_batch.inserted() {
-            let outcome = flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
-            if matches!(outcome, FlushOutcome::CommitFailed) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            if gift_batch.inserted() {
+                let outcome = flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
+                commit_failed |= matches!(outcome, FlushOutcome::CommitFailed);
+            }
+            if commit_failed {
+                tokio::select! {
+                    biased;
+                    _ = lag_interval.tick() => report_lag(&consumer, &writer_metrics),
+                    _ = tokio::time::sleep(commit_retry_delay) => {}
+                }
             }
             continue;
         }
@@ -139,18 +146,23 @@ async fn main() -> Result<()> {
                 }
             }
             _ = lag_interval.tick() => {
-                match consumer.report_lag() {
-                    Ok(lag_map) => {
-                        for (topic, lag) in lag_map {
-                            writer_metrics.consumer_lag
-                                .with_label_values(&[&topic])
-                                .set(lag as f64);
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "consumer lag report failed"),
-                }
+                report_lag(&consumer, &writer_metrics);
             }
         }
+    }
+}
+
+fn report_lag(consumer: &RedpandaConsumer, metrics: &bilive_sentinel::metrics::WriterMetrics) {
+    match consumer.report_lag() {
+        Ok(lag_map) => {
+            for (topic, lag) in lag_map {
+                metrics
+                    .consumer_lag
+                    .with_label_values(&[&topic])
+                    .set(lag as f64);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "consumer lag report failed"),
     }
 }
 
