@@ -711,7 +711,7 @@ async fn run_room_inner(
     write
         .send(Message::Binary(auth_packet.into()))
         .await
-        .map_err(|e| RoomError::Auth(e.to_string()))?;
+        .map_err(|e| RoomError::Network(e.to_string()))?;
     tracing::info!("auth sent");
 
     let room_id = auth.room_id;
@@ -765,6 +765,7 @@ async fn run_room_inner(
 enum RoomError {
     NoEndpoint,
     Endpoint(String),
+    #[allow(dead_code)] // reserved for future auth rejection handling
     Auth(String),
     Network(String),
     Protocol(String),
@@ -919,7 +920,7 @@ mod tests {
     #[test]
     fn refresh_auth_for_auth_errors() {
         assert!(should_refresh_auth(&RoomError::Auth(
-            "auth packet send failed".into()
+            "auth rejected".into()
         )));
     }
 
