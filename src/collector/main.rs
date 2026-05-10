@@ -659,22 +659,46 @@ async fn run_room_inner(
 ) -> Result<()> {
     const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-    let endpoint = auth
-        .endpoints
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no endpoints"))?;
-    let url = format!("wss://{}:{}/sub", endpoint.host, endpoint.port);
+    if auth.endpoints.is_empty() {
+        return Err(anyhow::anyhow!("no endpoints"));
+    }
 
-    tracing::info!(url, "connecting websocket");
-    let (ws_stream, _) = {
-        let _ep_permit = endpoint_semaphore
+    let mut ws_stream = None;
+    let mut last_error = None;
+
+    for endpoint in &auth.endpoints {
+        let url = format!("wss://{}:{}/sub", endpoint.host, endpoint.port);
+        tracing::info!(url, "trying endpoint");
+
+        let ep_permit = endpoint_semaphore
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
-        tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url))
-            .await
-            .map_err(|_| anyhow::anyhow!("websocket connect timed out"))??
+
+        let result = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(&url)).await;
+        drop(ep_permit);
+
+        match result {
+            Ok(Ok((stream, _))) => {
+                tracing::info!(url, "connected");
+                ws_stream = Some(stream);
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(url, error = %e, "endpoint connection failed");
+                last_error = Some(anyhow::anyhow!("{e}"));
+            }
+            Err(_) => {
+                tracing::warn!(url, "endpoint connection timed out");
+                last_error = Some(anyhow::anyhow!("websocket connect timed out"));
+            }
+        }
+    }
+
+    let Some(ws_stream) = ws_stream else {
+        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("all endpoints failed")));
     };
+
     let (mut write, mut read) = ws_stream.split();
 
     // Send auth
