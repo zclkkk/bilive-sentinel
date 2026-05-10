@@ -234,6 +234,7 @@ async fn run_registry_mode(
                     },
                     Err(e) => {
                         retries += 1;
+                        metrics.reconnects_total.inc();
                         if retries > max_retries {
                             tracing::warn!(
                                 room_id, retries, error = %e,

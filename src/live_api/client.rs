@@ -18,12 +18,12 @@ impl Default for LiveApiClient {
 }
 
 impl LiveApiClient {
-    pub fn new(api_limit: usize) -> Self {
+    pub fn new(api_concurrency_limit: usize) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .build()
             .expect("client build");
-        let api_semaphore = Arc::new(Semaphore::new(api_limit));
+        let api_semaphore = Arc::new(Semaphore::new(api_concurrency_limit));
         Self {
             http,
             api_semaphore,
