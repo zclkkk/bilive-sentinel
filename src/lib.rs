@@ -29,7 +29,7 @@ pub struct LogConfig {
 fn default_startup_delay_ms() -> u64 {
     200
 }
-fn default_api_rate_limit() -> usize {
+fn default_api_concurrency_limit() -> usize {
     10
 }
 fn default_endpoint_rate_limit() -> usize {
@@ -56,8 +56,8 @@ pub struct CollectorConfig {
     pub metrics_addr: String,
     #[serde(default = "default_startup_delay_ms")]
     pub startup_delay_ms: u64,
-    #[serde(default = "default_api_rate_limit")]
-    pub api_rate_limit: usize,
+    #[serde(default = "default_api_concurrency_limit")]
+    pub api_concurrency_limit: usize,
     #[serde(default = "default_endpoint_rate_limit")]
     pub endpoint_rate_limit: usize,
     #[serde(default = "default_reconnect_base_ms")]
@@ -211,7 +211,7 @@ bootstrap_servers = "localhost:9092"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.collector.startup_delay_ms, 200);
-        assert_eq!(config.collector.api_rate_limit, 10);
+        assert_eq!(config.collector.api_concurrency_limit, 10);
         assert_eq!(config.collector.endpoint_rate_limit, 20);
         assert_eq!(config.collector.reconnect_base_ms, 1000);
         assert_eq!(config.collector.reconnect_max_ms, 60000);
@@ -229,7 +229,7 @@ level = "info"
 [collector]
 metrics_addr = "0.0.0.0:9100"
 startup_delay_ms = 500
-api_rate_limit = 5
+api_concurrency_limit = 5
 endpoint_rate_limit = 15
 reconnect_base_ms = 2000
 reconnect_max_ms = 120000
@@ -255,7 +255,7 @@ bootstrap_servers = "localhost:9092"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.collector.startup_delay_ms, 500);
-        assert_eq!(config.collector.api_rate_limit, 5);
+        assert_eq!(config.collector.api_concurrency_limit, 5);
         assert_eq!(config.collector.endpoint_rate_limit, 15);
         assert_eq!(config.collector.reconnect_base_ms, 2000);
         assert_eq!(config.collector.reconnect_max_ms, 120000);

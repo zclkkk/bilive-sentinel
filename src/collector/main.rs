@@ -135,7 +135,8 @@ async fn run_single_room(
     metrics: bilive_sentinel::metrics::CollectorMetrics,
 ) -> Result<()> {
     let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
-    let client = bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_rate_limit);
+    let client =
+        bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_concurrency_limit);
     let ep_semaphore = Arc::new(Semaphore::new(config.collector.endpoint_rate_limit));
 
     tracing::info!(room_id, "fetching live auth");
@@ -176,7 +177,8 @@ async fn run_registry_mode(
     tracing::info!(count = leases.len(), "claimed rooms");
 
     let producer = RedpandaProducer::new(&config.redpanda.bootstrap_servers);
-    let client = bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_rate_limit);
+    let client =
+        bilive_sentinel::live_api::LiveApiClient::new(config.collector.api_concurrency_limit);
     let endpoint_semaphore = Arc::new(Semaphore::new(config.collector.endpoint_rate_limit));
 
     let base_ms = config.collector.reconnect_base_ms;
@@ -346,11 +348,13 @@ async fn run_room_inner(
     let url = format!("wss://{}:{}/sub", endpoint.host, endpoint.port);
 
     tracing::info!(url, "connecting websocket");
-    let _ep_permit = endpoint_semaphore
-        .acquire()
-        .await
-        .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
-    let (ws_stream, _) = connect_async(&url).await?;
+    let (ws_stream, _) = {
+        let _ep_permit = endpoint_semaphore
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("endpoint limiter closed"))?;
+        connect_async(&url).await?
+    };
     let (mut write, mut read) = ws_stream.split();
 
     // Send auth
