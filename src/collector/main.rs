@@ -758,6 +758,10 @@ async fn handle_packet(
                             publish_gift_with_retry(room_id, producer, metrics, &ev).await?;
                             metrics.events_total.with_label_values(&["gift"]).inc();
                         }
+                        LiveEvent::Malformed { command } => {
+                            tracing::warn!(command, "malformed event");
+                            metrics.parser_errors_total.inc();
+                        }
                         LiveEvent::Unsupported { .. } => {}
                     }
                 }

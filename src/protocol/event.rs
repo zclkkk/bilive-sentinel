@@ -33,6 +33,7 @@ pub enum LiveEvent {
     Danmaku(DanmakuEvent),
     Gift(GiftEvent),
     Unsupported { command: String },
+    Malformed { command: String },
 }
 
 pub fn parse_event(message: &serde_json::Value) -> LiveEvent {
@@ -41,17 +42,15 @@ pub fn parse_event(message: &serde_json::Value) -> LiveEvent {
         CMD_DANMU_MSG => {
             parse_danmaku(message)
                 .map(LiveEvent::Danmaku)
-                .unwrap_or(LiveEvent::Unsupported {
+                .unwrap_or(LiveEvent::Malformed {
                     command: cmd.to_string(),
                 })
         }
-        CMD_SEND_GIFT => {
-            parse_gift(message)
-                .map(LiveEvent::Gift)
-                .unwrap_or(LiveEvent::Unsupported {
-                    command: cmd.to_string(),
-                })
-        }
+        CMD_SEND_GIFT => parse_gift(message)
+            .map(LiveEvent::Gift)
+            .unwrap_or(LiveEvent::Malformed {
+                command: cmd.to_string(),
+            }),
         _ => LiveEvent::Unsupported {
             command: cmd.to_string(),
         },
@@ -265,6 +264,30 @@ mod tests {
         match parse_event(&msg) {
             LiveEvent::Unsupported { command } => assert_eq!(command, ""),
             _ => panic!("expected Unsupported"),
+        }
+    }
+
+    #[test]
+    fn known_cmd_bad_data_returns_malformed() {
+        let msg = serde_json::json!({"cmd": "DANMU_MSG", "info": "not_an_array"});
+        match parse_event(&msg) {
+            LiveEvent::Malformed { command } => assert_eq!(command, "DANMU_MSG"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+
+        let msg = serde_json::json!({"cmd": "SEND_GIFT", "data": {"uid": 1}});
+        match parse_event(&msg) {
+            LiveEvent::Malformed { command } => assert_eq!(command, "SEND_GIFT"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_cmd_returns_unsupported() {
+        let msg = serde_json::json!({"cmd": "INTERACT_WORD"});
+        match parse_event(&msg) {
+            LiveEvent::Unsupported { command } => assert_eq!(command, "INTERACT_WORD"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }
