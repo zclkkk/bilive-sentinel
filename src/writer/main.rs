@@ -1,13 +1,13 @@
 mod batch;
 
 use anyhow::Result;
-use batch::{FlushOutcome, try_flush};
+use batch::{FlushOutcome, PendingBatch, try_flush};
 use bilive_sentinel::clickhouse::{ClickHouseWriter, DanmakuRow, GiftRow};
 use bilive_sentinel::protocol::{DanmakuEvent, GiftEvent};
 use bilive_sentinel::redpanda::{DANMAKU_TOPIC, GIFT_TOPIC, LiveMessage, RedpandaConsumer};
 use bilive_sentinel::{Config, init_tracing, new_service_registry, start_metrics_server};
 use clap::Parser;
-use rdkafka::message::{Message, OwnedMessage};
+use rdkafka::message::Message;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -52,18 +52,33 @@ async fn main() -> Result<()> {
     let batch_size = config.writer.batch_size;
     let batch_timeout = Duration::from_millis(config.writer.batch_timeout_ms);
 
-    let mut danmaku_buf: Vec<DanmakuRow> = Vec::new();
-    let mut gift_buf: Vec<GiftRow> = Vec::new();
-    let mut last_danmaku_msg: Option<OwnedMessage> = None;
-    let mut last_gift_msg: Option<OwnedMessage> = None;
+    let mut danmaku_batch: PendingBatch<DanmakuRow> = PendingBatch::new();
+    let mut gift_batch: PendingBatch<GiftRow> = PendingBatch::new();
     let mut flush_interval = tokio::time::interval(batch_timeout);
     let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
+        if danmaku_batch.inserted() {
+            let outcome = flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
+            if matches!(outcome, FlushOutcome::CommitFailed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            continue;
+        }
+        if gift_batch.inserted() {
+            let outcome = flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
+            if matches!(outcome, FlushOutcome::CommitFailed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            continue;
+        }
+
         tokio::select! {
             msg = consumer.recv() => {
                 let msg = msg.map_err(|e| anyhow::anyhow!(e))?;
                 let topic = msg.topic().to_string();
+                let partition = msg.partition();
+                let next_offset = msg.offset() + 1;
                 let payload = match msg.payload() {
                     Some(p) => p,
                     None => {
@@ -76,8 +91,12 @@ async fn main() -> Result<()> {
                     DANMAKU_TOPIC => {
                         match serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
                             Ok(wrapper) => {
-                                danmaku_buf.push(danmaku_to_row(&wrapper));
-                                last_danmaku_msg = Some(msg);
+                                danmaku_batch.push(
+                                    danmaku_to_row(&wrapper),
+                                    &topic,
+                                    partition,
+                                    next_offset,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to deserialize danmaku payload");
@@ -87,8 +106,12 @@ async fn main() -> Result<()> {
                     GIFT_TOPIC => {
                         match serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
                             Ok(wrapper) => {
-                                gift_buf.push(gift_to_row(&wrapper));
-                                last_gift_msg = Some(msg);
+                                gift_batch.push(
+                                    gift_to_row(&wrapper),
+                                    &topic,
+                                    partition,
+                                    next_offset,
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to deserialize gift payload");
@@ -100,19 +123,19 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                if danmaku_buf.len() >= batch_size {
-                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg, &writer_metrics).await;
+                if danmaku_batch.len() >= batch_size {
+                    flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
                 }
-                if gift_buf.len() >= batch_size {
-                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
+                if gift_batch.len() >= batch_size {
+                    flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
                 }
             }
             _ = flush_interval.tick() => {
-                if !danmaku_buf.is_empty() {
-                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg, &writer_metrics).await;
+                if !danmaku_batch.is_empty() {
+                    flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
                 }
-                if !gift_buf.is_empty() {
-                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg, &writer_metrics).await;
+                if !gift_batch.is_empty() {
+                    flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
                 }
             }
             _ = lag_interval.tick() => {
@@ -134,65 +157,73 @@ async fn main() -> Result<()> {
 async fn flush_danmaku(
     ch: &ClickHouseWriter,
     consumer: &RedpandaConsumer,
-    buf: &mut Vec<DanmakuRow>,
-    last_msg: &mut Option<OwnedMessage>,
+    batch: &mut PendingBatch<DanmakuRow>,
     metrics: &bilive_sentinel::metrics::WriterMetrics,
-) {
-    metrics.batch_size.observe(buf.len() as f64);
-    let start = std::time::Instant::now();
-    let insert_result = ch.insert_danmaku(buf).await.map_err(|e| e.to_string());
-    metrics
-        .insert_latency
-        .observe(start.elapsed().as_secs_f64());
-    let msg_ref = last_msg.as_ref();
-    let outcome = try_flush(buf, insert_result, || {
-        if let Some(msg) = msg_ref {
-            consumer.commit(msg)
-        } else {
-            Ok(())
-        }
+) -> FlushOutcome {
+    if !batch.inserted() {
+        metrics.batch_size.observe(batch.len() as f64);
+    }
+    let insert_result = if batch.inserted() {
+        None
+    } else {
+        let start = std::time::Instant::now();
+        let result = ch
+            .insert_danmaku(batch.rows())
+            .await
+            .map_err(|e| e.to_string());
+        metrics
+            .insert_latency
+            .observe(start.elapsed().as_secs_f64());
+        Some(result)
+    };
+    let outcome = try_flush(batch, insert_result, |offsets| {
+        consumer.commit_offsets(offsets)
     });
     if matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["danmaku"]).inc();
-        last_msg.take();
     } else if matches!(outcome, FlushOutcome::CommitFailed) {
         metrics
             .commit_errors_total
             .with_label_values(&["danmaku"])
             .inc();
     }
+    outcome
 }
 
 async fn flush_gifts(
     ch: &ClickHouseWriter,
     consumer: &RedpandaConsumer,
-    buf: &mut Vec<GiftRow>,
-    last_msg: &mut Option<OwnedMessage>,
+    batch: &mut PendingBatch<GiftRow>,
     metrics: &bilive_sentinel::metrics::WriterMetrics,
-) {
-    metrics.batch_size.observe(buf.len() as f64);
-    let start = std::time::Instant::now();
-    let insert_result = ch.insert_gifts(buf).await.map_err(|e| e.to_string());
-    metrics
-        .insert_latency
-        .observe(start.elapsed().as_secs_f64());
-    let msg_ref = last_msg.as_ref();
-    let outcome = try_flush(buf, insert_result, || {
-        if let Some(msg) = msg_ref {
-            consumer.commit(msg)
-        } else {
-            Ok(())
-        }
+) -> FlushOutcome {
+    if !batch.inserted() {
+        metrics.batch_size.observe(batch.len() as f64);
+    }
+    let insert_result = if batch.inserted() {
+        None
+    } else {
+        let start = std::time::Instant::now();
+        let result = ch
+            .insert_gifts(batch.rows())
+            .await
+            .map_err(|e| e.to_string());
+        metrics
+            .insert_latency
+            .observe(start.elapsed().as_secs_f64());
+        Some(result)
+    };
+    let outcome = try_flush(batch, insert_result, |offsets| {
+        consumer.commit_offsets(offsets)
     });
     if matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["gifts"]).inc();
-        last_msg.take();
     } else if matches!(outcome, FlushOutcome::CommitFailed) {
         metrics
             .commit_errors_total
             .with_label_values(&["gifts"])
             .inc();
     }
+    outcome
 }
 
 fn danmaku_to_row(wrapper: &LiveMessage<DanmakuEvent>) -> DanmakuRow {

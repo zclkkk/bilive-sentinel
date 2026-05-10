@@ -84,6 +84,21 @@ pub struct RedpandaConsumer {
     consumer: StreamConsumer,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TopicPartition {
+    pub topic: String,
+    pub partition: i32,
+}
+
+impl TopicPartition {
+    pub fn new(topic: impl Into<String>, partition: i32) -> Self {
+        Self {
+            topic: topic.into(),
+            partition,
+        }
+    }
+}
+
 impl RedpandaConsumer {
     pub fn new(bootstrap_servers: &str, group_id: &str) -> Self {
         let consumer: StreamConsumer = ClientConfig::new()
@@ -111,12 +126,27 @@ impl RedpandaConsumer {
     }
 
     pub fn commit(&self, message: &OwnedMessage) -> Result<(), String> {
+        let mut offsets = HashMap::new();
+        offsets.insert(
+            TopicPartition::new(message.topic(), message.partition()),
+            message.offset() + 1,
+        );
+        self.commit_offsets(&offsets)
+    }
+
+    pub fn commit_offsets(&self, offsets: &HashMap<TopicPartition, i64>) -> Result<(), String> {
         use rdkafka::TopicPartitionList;
 
+        if offsets.is_empty() {
+            return Ok(());
+        }
+
         let mut tpl = TopicPartitionList::new();
-        tpl.add_partition(message.topic(), message.partition())
-            .set_offset(rdkafka::Offset::Offset(message.offset() + 1))
-            .map_err(|e| e.to_string())?;
+        for (topic_partition, offset) in offsets {
+            tpl.add_partition(&topic_partition.topic, topic_partition.partition)
+                .set_offset(rdkafka::Offset::Offset(*offset))
+                .map_err(|e| e.to_string())?;
+        }
 
         self.consumer
             .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
