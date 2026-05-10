@@ -1,4 +1,4 @@
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Message, OwnedMessage};
@@ -9,6 +9,9 @@ use std::time::Duration;
 
 pub const DANMAKU_TOPIC: &str = "bilibili.live.danmaku.v1";
 pub const GIFT_TOPIC: &str = "bilibili.live.gift.v1";
+pub const ROOM_STATUS_TOPIC: &str = "bilibili.live.room_status.v1";
+const TOPIC_PARTITIONS: i32 = 12;
+const PRODUCER_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveMessage<T> {
@@ -43,12 +46,11 @@ impl RedpandaProducer {
             received_at: now_secs(),
         };
         let payload = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
+        let key = room_id.to_string();
         self.producer
             .send(
-                FutureRecord::to(DANMAKU_TOPIC)
-                    .key(&room_id.to_string())
-                    .payload(&payload),
-                Duration::from_secs(0),
+                FutureRecord::to(DANMAKU_TOPIC).key(&key).payload(&payload),
+                PRODUCER_QUEUE_TIMEOUT,
             )
             .await
             .map_err(|(e, _)| e.to_string())?;
@@ -66,12 +68,11 @@ impl RedpandaProducer {
             received_at: now_secs(),
         };
         let payload = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
+        let key = room_id.to_string();
         self.producer
             .send(
-                FutureRecord::to(GIFT_TOPIC)
-                    .key(&room_id.to_string())
-                    .payload(&payload),
-                Duration::from_secs(0),
+                FutureRecord::to(GIFT_TOPIC).key(&key).payload(&payload),
+                PRODUCER_QUEUE_TIMEOUT,
             )
             .await
             .map_err(|(e, _)| e.to_string())?;
@@ -118,7 +119,7 @@ impl RedpandaConsumer {
             .map_err(|e| e.to_string())?;
 
         self.consumer
-            .commit(&tpl, rdkafka::consumer::CommitMode::Async)
+            .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
             .map_err(|e| e.to_string())
     }
 
@@ -157,12 +158,27 @@ pub async fn ensure_topics(bootstrap_servers: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let topics = [
-        NewTopic::new(DANMAKU_TOPIC, 1, TopicReplication::Fixed(1)),
-        NewTopic::new(GIFT_TOPIC, 1, TopicReplication::Fixed(1)),
+        NewTopic::new(DANMAKU_TOPIC, TOPIC_PARTITIONS, TopicReplication::Fixed(1)),
+        NewTopic::new(GIFT_TOPIC, TOPIC_PARTITIONS, TopicReplication::Fixed(1)),
+        NewTopic::new(
+            ROOM_STATUS_TOPIC,
+            TOPIC_PARTITIONS,
+            TopicReplication::Fixed(1),
+        ),
     ];
 
     admin
         .create_topics(topics.iter(), &AdminOptions::new())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let partitions = [
+        NewPartitions::new(DANMAKU_TOPIC, TOPIC_PARTITIONS as usize),
+        NewPartitions::new(GIFT_TOPIC, TOPIC_PARTITIONS as usize),
+        NewPartitions::new(ROOM_STATUS_TOPIC, TOPIC_PARTITIONS as usize),
+    ];
+    admin
+        .create_partitions(partitions.iter(), &AdminOptions::new())
         .await
         .map_err(|e| e.to_string())?;
 

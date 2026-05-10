@@ -155,6 +155,11 @@ async fn flush_danmaku(
     if matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["danmaku"]).inc();
         last_msg.take();
+    } else if matches!(outcome, FlushOutcome::CommitFailed) {
+        metrics
+            .commit_errors_total
+            .with_label_values(&["danmaku"])
+            .inc();
     }
 }
 
@@ -182,6 +187,11 @@ async fn flush_gifts(
     if matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["gifts"]).inc();
         last_msg.take();
+    } else if matches!(outcome, FlushOutcome::CommitFailed) {
+        metrics
+            .commit_errors_total
+            .with_label_values(&["gifts"])
+            .inc();
     }
 }
 

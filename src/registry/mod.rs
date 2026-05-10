@@ -1,6 +1,13 @@
 use chrono::{Duration, NaiveDateTime};
 use sqlx::PgPool;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomRunState {
+    Runnable,
+    Disabled,
+    LeaseLost,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Room {
     pub room_id: i64,
@@ -71,11 +78,44 @@ pub async fn set_room_enabled(
     room_id: i64,
     enabled: bool,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE rooms SET enabled = $2, updated_at = NOW() WHERE room_id = $1")
         .bind(room_id)
         .bind(enabled)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    if !enabled {
+        sqlx::query("DELETE FROM worker_leases WHERE room_id = $1")
+            .bind(room_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn mark_room_connected(pool: &PgPool, room_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE rooms
+         SET last_connected_at = NOW(), last_error = NULL, updated_at = NOW()
+         WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_room_error(pool: &PgPool, room_id: i64, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE rooms
+         SET last_error = $2, updated_at = NOW()
+         WHERE room_id = $1",
+    )
+    .bind(room_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -115,7 +155,14 @@ pub async fn renew_lease(
     let result = sqlx::query(
         "UPDATE worker_leases
          SET expires_at = NOW() + make_interval(secs => $3), last_heartbeat = NOW()
-         WHERE room_id = $1 AND worker_id = $2",
+         WHERE room_id = $1
+         AND worker_id = $2
+         AND expires_at > NOW()
+         AND EXISTS (
+             SELECT 1 FROM rooms
+             WHERE rooms.room_id = worker_leases.room_id
+             AND rooms.enabled = true
+         )",
     )
     .bind(room_id)
     .bind(worker_id)
@@ -123,6 +170,36 @@ pub async fn renew_lease(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn room_run_state(
+    pool: &PgPool,
+    room_id: i64,
+    worker_id: &str,
+) -> Result<RoomRunState, sqlx::Error> {
+    let row: Option<(bool, Option<String>, Option<bool>)> = sqlx::query_as(
+        "SELECT r.enabled,
+                wl.worker_id,
+                (wl.expires_at > NOW()) AS lease_current
+         FROM rooms r
+         LEFT JOIN worker_leases wl ON r.room_id = wl.room_id
+         WHERE r.room_id = $1",
+    )
+    .bind(room_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((enabled, lease_worker, lease_current)) = row else {
+        return Ok(RoomRunState::LeaseLost);
+    };
+    if !enabled {
+        return Ok(RoomRunState::Disabled);
+    }
+    if lease_worker.as_deref() == Some(worker_id) && lease_current.unwrap_or(false) {
+        Ok(RoomRunState::Runnable)
+    } else {
+        Ok(RoomRunState::LeaseLost)
+    }
 }
 
 pub async fn release_lease(
@@ -219,10 +296,15 @@ mod tests {
     async fn test_set_room_enabled() {
         let pool = test_pool().await;
         add_room(&pool, 100).await.unwrap();
+        claim_room(&pool, 100, "worker-1", Duration::seconds(60))
+            .await
+            .unwrap();
         super::set_room_enabled(&pool, 100, false).await.unwrap();
 
         let rooms = list_rooms(&pool).await.unwrap();
         assert!(!rooms[0].enabled);
+        let leases = list_leases(&pool).await.unwrap();
+        assert!(leases.is_empty());
     }
 
     #[tokio::test]
@@ -291,6 +373,62 @@ mod tests {
             .await
             .unwrap();
         assert!(renewed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn renew_disabled_room_fails() {
+        let pool = test_pool().await;
+        add_room(&pool, 550).await.unwrap();
+        claim_room(&pool, 550, "worker-1", Duration::seconds(60))
+            .await
+            .unwrap();
+        set_room_enabled(&pool, 550, false).await.unwrap();
+
+        let renewed = renew_lease(&pool, 550, "worker-1", Duration::seconds(120))
+            .await
+            .unwrap();
+        assert!(!renewed);
+        assert_eq!(
+            room_run_state(&pool, 550, "worker-1").await.unwrap(),
+            RoomRunState::Disabled
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn room_run_state_detects_lost_lease() {
+        let pool = test_pool().await;
+        add_room(&pool, 560).await.unwrap();
+        claim_room(&pool, 560, "worker-1", Duration::seconds(60))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            room_run_state(&pool, 560, "worker-1").await.unwrap(),
+            RoomRunState::Runnable
+        );
+        assert_eq!(
+            room_run_state(&pool, 560, "worker-2").await.unwrap(),
+            RoomRunState::LeaseLost
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mark_room_status() {
+        let pool = test_pool().await;
+        add_room(&pool, 570).await.unwrap();
+
+        mark_room_error(&pool, 570, "boom").await.unwrap();
+        let room = list_rooms(&pool).await.unwrap().pop().unwrap();
+        assert_eq!(room.last_error.as_deref(), Some("boom"));
+        assert!(room.last_connected_at.is_none());
+
+        mark_room_connected(&pool, 570).await.unwrap();
+        let room = list_rooms(&pool).await.unwrap().pop().unwrap();
+        assert!(room.last_error.is_none());
+        assert!(room.last_connected_at.is_some());
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use prometheus::{
 pub struct CollectorMetrics {
     pub active_rooms: Gauge,
     pub events_total: IntCounterVec,
+    pub publish_errors_total: IntCounterVec,
     pub parser_errors_total: IntCounter,
     pub reconnects_total: IntCounter,
 }
@@ -13,6 +14,7 @@ pub struct CollectorMetrics {
 #[derive(Clone)]
 pub struct WriterMetrics {
     pub inserts_total: IntCounterVec,
+    pub commit_errors_total: IntCounterVec,
     pub batch_size: Histogram,
     pub insert_latency: Histogram,
     pub consumer_lag: GaugeVec,
@@ -24,6 +26,14 @@ impl CollectorMetrics {
             Gauge::with_opts(Opts::new("bilive_active_rooms", "Number of active rooms")).unwrap();
         let events_total = IntCounterVec::new(
             Opts::new("bilive_events_total", "Total events processed"),
+            &["type"],
+        )
+        .unwrap();
+        let publish_errors_total = IntCounterVec::new(
+            Opts::new(
+                "bilive_publish_errors_total",
+                "Total event publish failures",
+            ),
             &["type"],
         )
         .unwrap();
@@ -41,6 +51,9 @@ impl CollectorMetrics {
         registry.register(Box::new(active_rooms.clone())).unwrap();
         registry.register(Box::new(events_total.clone())).unwrap();
         registry
+            .register(Box::new(publish_errors_total.clone()))
+            .unwrap();
+        registry
             .register(Box::new(parser_errors_total.clone()))
             .unwrap();
         registry
@@ -50,6 +63,7 @@ impl CollectorMetrics {
         Self {
             active_rooms,
             events_total,
+            publish_errors_total,
             parser_errors_total,
             reconnects_total,
         }
@@ -60,6 +74,11 @@ impl WriterMetrics {
     pub fn register(registry: &Registry) -> Self {
         let inserts_total = IntCounterVec::new(
             Opts::new("bilive_inserts_total", "Total ClickHouse inserts"),
+            &["table"],
+        )
+        .unwrap();
+        let commit_errors_total = IntCounterVec::new(
+            Opts::new("bilive_commit_errors_total", "Total Redpanda commit errors"),
             &["table"],
         )
         .unwrap();
@@ -88,12 +107,16 @@ impl WriterMetrics {
         .unwrap();
 
         registry.register(Box::new(inserts_total.clone())).unwrap();
+        registry
+            .register(Box::new(commit_errors_total.clone()))
+            .unwrap();
         registry.register(Box::new(batch_size.clone())).unwrap();
         registry.register(Box::new(insert_latency.clone())).unwrap();
         registry.register(Box::new(consumer_lag.clone())).unwrap();
 
         Self {
             inserts_total,
+            commit_errors_total,
             batch_size,
             insert_latency,
             consumer_lag,

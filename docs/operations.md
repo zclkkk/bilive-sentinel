@@ -71,11 +71,13 @@ cargo run --bin collector -- --check-live-auth 21484828
 - `bilive_active_rooms` — 应与预期房间数一致
 - `bilive_reconnects_total` — 速率过高表示网络或鉴权问题
 - `bilive_parser_errors_total` — 非零表示收到 Bilibili 的畸形消息
+- `bilive_publish_errors_total` — 非零表示事件发布到 Redpanda 失败，collector 会中断当前连接并重连
 
 **Writer 健康：**
 - `bilive_insert_latency_seconds` — p99 应低于 1 秒（本地 ClickHouse）
 - `bilive_consumer_lag` — 持续增长表示 writer 处理速度不足
 - `bilive_inserts_total` — 应稳定增长
+- `bilive_commit_errors_total` — 非零表示 ClickHouse 已写入但 Redpanda offset 提交失败，可能造成重放重复
 
 **全局：**
 - `bilive_sentinel_up` — 1 表示服务运行中
@@ -113,7 +115,7 @@ curl -X PUT http://localhost:8080/rooms/21484828/disable
 curl -X PUT http://localhost:8080/rooms/21484828/enable
 ```
 
-禁用房间会阻止新的认领。不会中断已连接的房间；房间会在下次重连时因租约过期而停止。
+禁用房间会删除该房间的当前租约并阻止新的认领。collector 会在下一次租约状态检查时停止已连接的房间任务。
 
 ### 列出租约
 

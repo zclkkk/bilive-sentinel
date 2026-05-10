@@ -1,6 +1,7 @@
 pub enum FlushOutcome {
     Committed,
     InsertFailed,
+    CommitFailed,
     Empty,
 }
 
@@ -14,10 +15,11 @@ pub fn try_flush<T>(
     }
     match insert_result {
         Ok(()) => {
-            buf.clear();
             if let Err(e) = commit() {
                 tracing::warn!(error = %e, "commit failed after successful insert");
+                return FlushOutcome::CommitFailed;
             }
+            buf.clear();
             FlushOutcome::Committed
         }
         Err(e) => {
@@ -63,6 +65,16 @@ mod tests {
         assert!(matches!(outcome, FlushOutcome::InsertFailed));
         assert_eq!(buf.len(), 3);
         assert!(!commit_called.get());
+    }
+
+    #[test]
+    fn commit_failure_keeps_batch_visible() {
+        let mut buf = vec![1, 2, 3];
+
+        let outcome = try_flush(&mut buf, Ok(()), || Err("commit failed".into()));
+
+        assert!(matches!(outcome, FlushOutcome::CommitFailed));
+        assert_eq!(buf.len(), 3);
     }
 
     #[test]

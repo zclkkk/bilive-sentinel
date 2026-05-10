@@ -120,27 +120,30 @@ pub fn parse_gift(message: &serde_json::Value) -> Option<GiftEvent> {
     }
 
     let d = msg.data?;
-    if d.giftId.is_none() && d.giftName.is_none() {
-        return None;
-    }
+    let gift_name = d.giftName.filter(|s| !s.is_empty())?;
+    let coin_type = normalize_coin_type(d.coin_type.as_deref()?)?;
+    let uname = d.uname.filter(|s| !s.is_empty())?;
 
     Some(GiftEvent {
-        uid: d.uid.unwrap_or(0),
-        uname: d.uname.unwrap_or_default(),
-        gift_id: d.giftId.unwrap_or(0),
-        gift_name: d.giftName.unwrap_or_default(),
-        coin_type: d.coin_type.unwrap_or_else(|| "silver".into()),
-        total_coin: d.price.unwrap_or(1),
-        num: d.num.unwrap_or(1),
-        timestamp: d.timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        }),
+        uid: d.uid?,
+        uname,
+        gift_id: d.giftId?,
+        gift_name,
+        coin_type: coin_type.to_string(),
+        total_coin: d.price?,
+        num: d.num?,
+        timestamp: d.timestamp?,
         command_type: CMD_SEND_GIFT.to_string(),
         parser_version: PARSER_VERSION,
     })
+}
+
+fn normalize_coin_type(coin_type: &str) -> Option<&'static str> {
+    match coin_type {
+        "gold" => Some("gold"),
+        "silver" => Some("silver"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_gift_partial_data() {
+    fn parse_gift_rejects_partial_data() {
         let msg = serde_json::json!({
             "cmd": "SEND_GIFT",
             "data": {
@@ -214,13 +217,25 @@ mod tests {
                 "giftName": "test"
             }
         });
-        let event = parse_gift(&msg).unwrap();
-        assert_eq!(event.gift_id, 123);
-        assert_eq!(event.gift_name, "test");
-        assert_eq!(event.coin_type, "silver");
-        assert_eq!(event.total_coin, 1);
-        assert_eq!(event.num, 1);
-        assert!(event.timestamp > 0);
+        assert!(parse_gift(&msg).is_none());
+    }
+
+    #[test]
+    fn parse_gift_rejects_unknown_coin_type() {
+        let msg = serde_json::json!({
+            "cmd": "SEND_GIFT",
+            "data": {
+                "uid": 456,
+                "uname": "gift_user",
+                "giftId": 123,
+                "giftName": "test_gift",
+                "coin_type": "points",
+                "price": 100,
+                "num": 2,
+                "timestamp": 1700000000
+            }
+        });
+        assert!(parse_gift(&msg).is_none());
     }
 
     #[test]

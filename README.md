@@ -186,6 +186,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 |------|------|------|------|
 | `bilive_active_rooms` | Gauge | — | 当前连接的房间数 |
 | `bilive_events_total` | Counter | `type`（danmaku/gift） | 已处理事件总数 |
+| `bilive_publish_errors_total` | Counter | `type`（danmaku/gift） | 发布到 Redpanda 失败次数 |
 | `bilive_parser_errors_total` | Counter | — | 解析错误总数 |
 | `bilive_reconnects_total` | Counter | — | 重连尝试总数 |
 
@@ -194,6 +195,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | 指标 | 类型 | 标签 | 说明 |
 |------|------|------|------|
 | `bilive_inserts_total` | Counter | `table`（danmaku/gifts） | ClickHouse 写入次数 |
+| `bilive_commit_errors_total` | Counter | `table`（danmaku/gifts） | Redpanda offset 提交失败次数 |
 | `bilive_batch_size` | Histogram | — | 写入批次大小 |
 | `bilive_insert_latency_seconds` | Histogram | — | ClickHouse 写入耗时 |
 | `bilive_consumer_lag` | Gauge | `topic` | Redpanda 消费延迟 |
@@ -267,6 +269,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 |-------|-----|---------|
 | `bilibili.live.danmaku.v1` | room_id | `LiveMessage<DanmakuEvent>`（JSON） |
 | `bilibili.live.gift.v1` | room_id | `LiveMessage<GiftEvent>`（JSON） |
+| `bilibili.live.room_status.v1` | room_id | 预留房间状态事件 |
 
 ## 测试
 
