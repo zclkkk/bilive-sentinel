@@ -1,7 +1,7 @@
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::message::OwnedMessage;
+use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -105,6 +105,19 @@ impl RedpandaConsumer {
             .await
             .map_err(|e| e.to_string())
             .map(|message| message.detach())
+    }
+
+    pub fn commit(&self, message: &OwnedMessage) -> Result<(), String> {
+        use rdkafka::TopicPartitionList;
+
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition(message.topic(), message.partition())
+            .set_offset(rdkafka::Offset::Offset(message.offset() + 1))
+            .map_err(|e| e.to_string())?;
+
+        self.consumer
+            .commit(&tpl, rdkafka::consumer::CommitMode::Async)
+            .map_err(|e| e.to_string())
     }
 }
 

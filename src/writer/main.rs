@@ -4,7 +4,7 @@ use bilive_sentinel::protocol::{DanmakuEvent, GiftEvent};
 use bilive_sentinel::redpanda::{DANMAKU_TOPIC, GIFT_TOPIC, LiveMessage, RedpandaConsumer};
 use bilive_sentinel::{Config, init_tracing, new_service_registry, start_metrics_server};
 use clap::Parser;
-use rdkafka::message::Message;
+use rdkafka::message::{Message, OwnedMessage};
 use std::time::Duration;
 
 const BATCH_SIZE: usize = 100;
@@ -50,6 +50,8 @@ async fn main() -> Result<()> {
 
     let mut danmaku_buf: Vec<DanmakuRow> = Vec::new();
     let mut gift_buf: Vec<GiftRow> = Vec::new();
+    let mut last_danmaku_msg: Option<OwnedMessage> = None;
+    let mut last_gift_msg: Option<OwnedMessage> = None;
     let mut flush_interval = tokio::time::interval(BATCH_TIMEOUT);
 
     loop {
@@ -59,58 +61,99 @@ async fn main() -> Result<()> {
                 let topic = msg.topic().to_string();
                 let payload = match msg.payload() {
                     Some(p) => p,
-                    None => continue,
+                    None => {
+                        tracing::warn!("received message with no payload, skipping");
+                        continue;
+                    }
                 };
 
                 match topic.as_str() {
                     DANMAKU_TOPIC => {
-                        if let Ok(wrapper) = serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
-                            danmaku_buf.push(danmaku_to_row(&wrapper));
+                        match serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
+                            Ok(wrapper) => {
+                                danmaku_buf.push(danmaku_to_row(&wrapper));
+                                last_danmaku_msg = Some(msg);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to deserialize danmaku payload");
+                            }
                         }
                     }
                     GIFT_TOPIC => {
-                        if let Ok(wrapper) = serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
-                            gift_buf.push(gift_to_row(&wrapper));
+                        match serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
+                            Ok(wrapper) => {
+                                gift_buf.push(gift_to_row(&wrapper));
+                                last_gift_msg = Some(msg);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to deserialize gift payload");
+                            }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        tracing::warn!(topic, "message on unknown topic");
+                    }
                 }
 
                 if danmaku_buf.len() >= BATCH_SIZE {
-                    if let Err(e) = ch.insert_danmaku(&danmaku_buf).await {
-                        tracing::warn!(error = %e, "insert danmaku failed");
-                    } else {
-                        tracing::debug!(count = danmaku_buf.len(), "inserted danmaku batch");
-                    }
-                    danmaku_buf.clear();
+                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg).await;
                 }
                 if gift_buf.len() >= BATCH_SIZE {
-                    if let Err(e) = ch.insert_gifts(&gift_buf).await {
-                        tracing::warn!(error = %e, "insert gifts failed");
-                    } else {
-                        tracing::debug!(count = gift_buf.len(), "inserted gift batch");
-                    }
-                    gift_buf.clear();
+                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg).await;
                 }
             }
             _ = flush_interval.tick() => {
                 if !danmaku_buf.is_empty() {
-                    if let Err(e) = ch.insert_danmaku(&danmaku_buf).await {
-                        tracing::warn!(error = %e, "insert danmaku failed");
-                    } else {
-                        tracing::debug!(count = danmaku_buf.len(), "flushed danmaku batch");
-                    }
-                    danmaku_buf.clear();
+                    flush_danmaku(&ch, &consumer, &mut danmaku_buf, &mut last_danmaku_msg).await;
                 }
                 if !gift_buf.is_empty() {
-                    if let Err(e) = ch.insert_gifts(&gift_buf).await {
-                        tracing::warn!(error = %e, "insert gifts failed");
-                    } else {
-                        tracing::debug!(count = gift_buf.len(), "flushed gift batch");
-                    }
-                    gift_buf.clear();
+                    flush_gifts(&ch, &consumer, &mut gift_buf, &mut last_gift_msg).await;
                 }
             }
+        }
+    }
+}
+
+async fn flush_danmaku(
+    ch: &ClickHouseWriter,
+    consumer: &RedpandaConsumer,
+    buf: &mut Vec<DanmakuRow>,
+    last_msg: &mut Option<OwnedMessage>,
+) {
+    match ch.insert_danmaku(buf).await {
+        Ok(()) => {
+            tracing::debug!(count = buf.len(), "inserted danmaku batch");
+            buf.clear();
+            if let Some(msg) = last_msg.take()
+                && let Err(e) = consumer.commit(&msg)
+            {
+                tracing::warn!(error = %e, "commit danmaku offset failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, count = buf.len(), "insert danmaku failed, keeping batch");
+        }
+    }
+}
+
+async fn flush_gifts(
+    ch: &ClickHouseWriter,
+    consumer: &RedpandaConsumer,
+    buf: &mut Vec<GiftRow>,
+    last_msg: &mut Option<OwnedMessage>,
+) {
+    match ch.insert_gifts(buf).await {
+        Ok(()) => {
+            tracing::debug!(count = buf.len(), "inserted gift batch");
+            buf.clear();
+            if let Some(msg) = last_msg.take()
+                && let Err(e) = consumer.commit(&msg)
+            {
+                tracing::warn!(error = %e, "commit gift offset failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, count = buf.len(), "insert gifts failed, keeping batch");
         }
     }
 }
