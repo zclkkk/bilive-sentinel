@@ -70,8 +70,8 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
         .route("/rooms", axum::routing::get(list_rooms).post(add_room))
-        .route("/rooms/{room_id}/enable", axum::routing::put(enable_room))
-        .route("/rooms/{room_id}/disable", axum::routing::put(disable_room))
+        .route("/rooms/:room_id/enable", axum::routing::put(enable_room))
+        .route("/rooms/:room_id/disable", axum::routing::put(disable_room))
         .route("/leases", axum::routing::get(list_leases))
         .with_state(state);
 
