@@ -1,6 +1,10 @@
-use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication};
+use rdkafka::admin::{
+    AdminClient, AdminOptions, NewPartitions, NewTopic, TopicReplication, TopicResult,
+};
+use rdkafka::client::ClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::{Deserialize, Serialize};
@@ -197,21 +201,105 @@ pub async fn ensure_topics(bootstrap_servers: &str) -> Result<(), String> {
         ),
     ];
 
-    admin
+    let topic_results = admin
         .create_topics(topics.iter(), &AdminOptions::new())
         .await
         .map_err(|e| e.to_string())?;
+    check_admin_results(
+        "create topic",
+        topic_results,
+        &[RDKafkaErrorCode::TopicAlreadyExists],
+    )?;
 
-    let partitions = [
-        NewPartitions::new(DANMAKU_TOPIC, TOPIC_PARTITIONS as usize),
-        NewPartitions::new(GIFT_TOPIC, TOPIC_PARTITIONS as usize),
-        NewPartitions::new(ROOM_STATUS_TOPIC, TOPIC_PARTITIONS as usize),
-    ];
-    admin
-        .create_partitions(partitions.iter(), &AdminOptions::new())
-        .await
+    ensure_partition_count(
+        &admin,
+        &[DANMAKU_TOPIC, GIFT_TOPIC, ROOM_STATUS_TOPIC],
+        TOPIC_PARTITIONS as usize,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn ensure_partition_count<C: ClientContext>(
+    admin: &AdminClient<C>,
+    topic_names: &[&str],
+    partition_count: usize,
+) -> Result<(), String> {
+    let metadata = admin
+        .inner()
+        .fetch_metadata(None, Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
+    let partitions: Vec<_> = topic_names
+        .iter()
+        .filter_map(|topic| {
+            let current = metadata
+                .topics()
+                .iter()
+                .find(|metadata_topic| metadata_topic.name() == *topic)
+                .map(|metadata_topic| metadata_topic.partitions().len());
+            if current.is_some_and(|count| count >= partition_count) {
+                None
+            } else {
+                Some(NewPartitions::new(topic, partition_count))
+            }
+        })
+        .collect();
 
+    if !partitions.is_empty() {
+        let partition_results = admin
+            .create_partitions(partitions.iter(), &AdminOptions::new())
+            .await
+            .map_err(|e| e.to_string())?;
+        check_admin_results(
+            "create partitions",
+            partition_results,
+            &[
+                RDKafkaErrorCode::InvalidPartitions,
+                RDKafkaErrorCode::InvalidRequest,
+            ],
+        )?;
+    }
+
+    let metadata = admin
+        .inner()
+        .fetch_metadata(None, Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    for topic in topic_names {
+        let Some(metadata_topic) = metadata
+            .topics()
+            .iter()
+            .find(|metadata_topic| metadata_topic.name() == *topic)
+        else {
+            return Err(format!("topic {topic} missing after ensure"));
+        };
+        let current = metadata_topic.partitions().len();
+        if current < partition_count {
+            return Err(format!(
+                "topic {topic} has {current} partitions, expected at least {partition_count}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_admin_results(
+    operation: &str,
+    results: Vec<TopicResult>,
+    allowed_errors: &[RDKafkaErrorCode],
+) -> Result<(), String> {
+    for result in results {
+        match result {
+            Ok(_) => {}
+            Err((topic, code)) if allowed_errors.contains(&code) => {
+                tracing::debug!(operation, topic, error = ?code, "admin result already satisfied");
+            }
+            Err((topic, code)) => {
+                return Err(format!("{operation} failed for {topic}: {code:?}"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -220,4 +308,43 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_results_allow_expected_errors() {
+        let results = vec![
+            Ok("topic-a".to_string()),
+            Err(("topic-b".to_string(), RDKafkaErrorCode::TopicAlreadyExists)),
+        ];
+
+        assert!(
+            check_admin_results(
+                "create topic",
+                results,
+                &[RDKafkaErrorCode::TopicAlreadyExists],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn admin_results_reject_unexpected_errors() {
+        let results = vec![Err((
+            "topic-a".to_string(),
+            RDKafkaErrorCode::InvalidReplicationFactor,
+        ))];
+
+        let err = check_admin_results(
+            "create topic",
+            results,
+            &[RDKafkaErrorCode::TopicAlreadyExists],
+        )
+        .expect_err("unexpected errors must fail");
+
+        assert!(err.contains("InvalidReplicationFactor"));
+    }
 }
