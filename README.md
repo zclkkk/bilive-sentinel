@@ -290,7 +290,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 ## 测试
 
 ```bash
-# 单元测试（不需要基础设施）
+# 单元测试（需要 PostgreSQL，registry 测试连接本地数据库）
 cargo test --lib
 
 # 全部测试（需要 PostgreSQL、Redpanda、ClickHouse 运行）
@@ -299,8 +299,6 @@ cargo test
 # 仅集成测试
 cargo test --test multi_room_stability
 ```
-
-registry 测试依赖本地 PostgreSQL。集成测试依赖全部三个服务。
 
 ## 停止
 
