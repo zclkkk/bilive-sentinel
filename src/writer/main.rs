@@ -90,7 +90,12 @@ async fn main() -> Result<()> {
                     Some(p) => p,
                     None => {
                         tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, skipping");
-                        skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
+                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                        match topic.as_str() {
+                            DANMAKU_TOPIC => danmaku_batch.advance_offset(&topic, partition, next_offset),
+                            GIFT_TOPIC => gift_batch.advance_offset(&topic, partition, next_offset),
+                            _ => {}
+                        }
                         continue;
                     }
                 };
@@ -110,7 +115,8 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, topic, "bad danmaku payload, skipping");
-                                skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
+                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                                danmaku_batch.advance_offset(&topic, partition, next_offset);
                             }
                         }
                     }
@@ -126,7 +132,8 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, topic, "bad gift payload, skipping");
-                                skip_bad_message(&consumer, &writer_metrics, &topic, &msg);
+                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                                gift_batch.advance_offset(&topic, partition, next_offset);
                             }
                         }
                     }
@@ -143,10 +150,10 @@ async fn main() -> Result<()> {
                 }
             }
             _ = flush_interval.tick() => {
-                if !danmaku_batch.is_empty() {
+                if danmaku_batch.has_pending_offsets() {
                     flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
                 }
-                if !gift_batch.is_empty() {
+                if gift_batch.has_pending_offsets() {
                     flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
                 }
             }
@@ -154,27 +161,6 @@ async fn main() -> Result<()> {
                 report_lag(&consumer, &writer_metrics);
             }
         }
-    }
-}
-
-fn skip_bad_message(
-    consumer: &RedpandaConsumer,
-    metrics: &bilive_sentinel::metrics::WriterMetrics,
-    topic: &str,
-    msg: &rdkafka::message::OwnedMessage,
-) {
-    metrics.bad_messages_total.with_label_values(&[topic]).inc();
-    if let Err(e) = consumer.commit(msg) {
-        tracing::warn!(error = %e, topic, "commit bad message offset failed");
-        let table = match topic {
-            DANMAKU_TOPIC => "danmaku",
-            GIFT_TOPIC => "gifts",
-            _ => "unknown",
-        };
-        metrics
-            .commit_errors_total
-            .with_label_values(&[table])
-            .inc();
     }
 }
 
@@ -198,10 +184,10 @@ async fn flush_danmaku(
     batch: &mut PendingBatch<DanmakuRow>,
     metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) -> FlushOutcome {
-    if !batch.inserted() {
+    if !batch.inserted() && !batch.is_empty() {
         metrics.batch_size.observe(batch.len() as f64);
     }
-    let insert_result = if batch.inserted() {
+    let insert_result = if batch.inserted() || batch.is_empty() {
         None
     } else {
         let start = std::time::Instant::now();
@@ -234,10 +220,10 @@ async fn flush_gifts(
     batch: &mut PendingBatch<GiftRow>,
     metrics: &bilive_sentinel::metrics::WriterMetrics,
 ) -> FlushOutcome {
-    if !batch.inserted() {
+    if !batch.inserted() && !batch.is_empty() {
         metrics.batch_size.observe(batch.len() as f64);
     }
-    let insert_result = if batch.inserted() {
+    let insert_result = if batch.inserted() || batch.is_empty() {
         None
     } else {
         let start = std::time::Instant::now();

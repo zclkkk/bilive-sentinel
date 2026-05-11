@@ -26,6 +26,10 @@ impl<T> PendingBatch<T> {
     pub fn push(&mut self, row: T, topic: &str, partition: i32, next_offset: i64) {
         debug_assert!(!self.inserted);
         self.rows.push(row);
+        self.advance_offset(topic, partition, next_offset);
+    }
+
+    pub fn advance_offset(&mut self, topic: &str, partition: i32, next_offset: i64) {
         self.offsets
             .entry(TopicPartition::new(topic, partition))
             .and_modify(|offset| *offset = (*offset).max(next_offset))
@@ -42,6 +46,10 @@ impl<T> PendingBatch<T> {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    pub fn has_pending_offsets(&self) -> bool {
+        !self.offsets.is_empty()
     }
 
     pub fn inserted(&self) -> bool {
@@ -68,11 +76,12 @@ pub fn try_flush<T>(
     insert_result: Option<Result<(), String>>,
     commit: impl FnOnce(&HashMap<TopicPartition, i64>) -> Result<(), String>,
 ) -> FlushOutcome {
-    if batch.is_empty() {
+    if !batch.has_pending_offsets() {
         return FlushOutcome::Empty;
     }
 
-    if !batch.inserted() {
+    // Has rows but not yet inserted — must insert first
+    if !batch.is_empty() && !batch.inserted() {
         match insert_result {
             Some(Ok(())) => batch.mark_inserted(),
             Some(Err(e)) => {
@@ -87,7 +96,7 @@ pub fn try_flush<T>(
     }
 
     if let Err(e) = commit(batch.offsets()) {
-        tracing::warn!(error = %e, "commit failed after successful insert");
+        tracing::warn!(error = %e, "commit failed");
         return FlushOutcome::CommitFailed;
     }
 
@@ -190,6 +199,47 @@ mod tests {
         let mut batch: PendingBatch<i32> = PendingBatch::new();
         let outcome = try_flush(&mut batch, Some(Ok(())), |_| Ok(()));
         assert!(matches!(outcome, FlushOutcome::Empty));
+    }
+
+    #[test]
+    fn advance_offset_without_row() {
+        let mut batch: PendingBatch<i32> = PendingBatch::new();
+        batch.advance_offset("topic", 0, 5);
+        batch.advance_offset("topic", 0, 3); // lower, should not overwrite
+        batch.advance_offset("topic", 1, 7);
+
+        assert!(batch.is_empty()); // no rows
+        assert!(batch.has_pending_offsets());
+        assert_eq!(
+            batch.offsets().get(&TopicPartition::new("topic", 0)),
+            Some(&5)
+        );
+        assert_eq!(
+            batch.offsets().get(&TopicPartition::new("topic", 1)),
+            Some(&7)
+        );
+    }
+
+    #[test]
+    fn offset_only_flush_commits_and_clears() {
+        let mut batch: PendingBatch<i32> = PendingBatch::new();
+        batch.advance_offset("topic", 0, 5);
+        batch.advance_offset("topic", 1, 7);
+
+        let commit_called = Rc::new(Cell::new(false));
+        let cc = commit_called.clone();
+
+        let outcome = try_flush(&mut batch, None, |offsets| {
+            cc.set(true);
+            assert_eq!(offsets.len(), 2);
+            Ok(())
+        });
+
+        assert!(matches!(outcome, FlushOutcome::Committed));
+        assert!(batch.is_empty());
+        assert!(!batch.has_pending_offsets());
+        assert!(!batch.inserted());
+        assert!(commit_called.get());
     }
 
     #[test]
