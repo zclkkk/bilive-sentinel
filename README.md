@@ -286,7 +286,6 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | writer commit 失败重试期间暂停消费 | 是 | 可以 | 当 batch 处于 inserted-pending-commit 状态时，writer 暂停消费新消息并重试 commit；可改为异步重试队列以减少消费暂停时间。 |
 | consumer lag 只读取本地 consumer 状态 | 是 | 可以 | 当前 lag 基于 consumer position 与 committed offset，不能代表 broker 端真实 high watermark lag；可改为按 partition 查询 watermark 后计算。 |
 | API 没有认证 | 是 | 可以 | 本地开发可接受，但生产或公网部署前需要加鉴权、网络隔离，或放在受保护的管理网内。 |
-| auth 失效判断仍使用简单错误字符串匹配 | 是 | 可以 | 当前根据错误文本决定是否复用 auth；可改成结构化错误类型，明确区分网络、endpoint、auth、权限/session 等失败。 |
 
 ## 测试
 
