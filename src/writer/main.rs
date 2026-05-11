@@ -200,10 +200,11 @@ async fn flush_danmaku(
             .observe(start.elapsed().as_secs_f64());
         Some(result)
     };
+    let had_rows = !batch.is_empty();
     let outcome = try_flush(batch, insert_result, |offsets| {
         consumer.commit_offsets(offsets)
     });
-    if matches!(outcome, FlushOutcome::Committed) {
+    if had_rows && matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["danmaku"]).inc();
     } else if matches!(outcome, FlushOutcome::CommitFailed) {
         metrics
@@ -236,10 +237,11 @@ async fn flush_gifts(
             .observe(start.elapsed().as_secs_f64());
         Some(result)
     };
+    let had_rows = !batch.is_empty();
     let outcome = try_flush(batch, insert_result, |offsets| {
         consumer.commit_offsets(offsets)
     });
-    if matches!(outcome, FlushOutcome::Committed) {
+    if had_rows && matches!(outcome, FlushOutcome::Committed) {
         metrics.inserts_total.with_label_values(&["gifts"]).inc();
     } else if matches!(outcome, FlushOutcome::CommitFailed) {
         metrics
