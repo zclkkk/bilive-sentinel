@@ -158,28 +158,33 @@ impl RedpandaConsumer {
     }
 
     pub fn report_lag(&self) -> Result<HashMap<String, i64>, String> {
-        let position = self.consumer.position().map_err(|e| e.to_string())?;
+        let assignment = self.consumer.assignment().map_err(|e| e.to_string())?;
         let committed = self
             .consumer
             .committed(Duration::from_secs(1))
             .map_err(|e| e.to_string())?;
 
         let mut lag_map: HashMap<String, i64> = HashMap::new();
-        for pos_elem in position.elements() {
-            let pos_offset = match pos_elem.offset() {
-                rdkafka::Offset::Offset(o) => o,
-                _ => continue,
-            };
+        for assignment_elem in assignment.elements() {
+            let topic = assignment_elem.topic();
+            let partition = assignment_elem.partition();
+            let (low_watermark, high_watermark) = self
+                .consumer
+                .fetch_watermarks(topic, partition, Duration::from_secs(1))
+                .map_err(|e| e.to_string())?;
             let commit_offset = committed
                 .elements()
                 .iter()
-                .find(|c| c.topic() == pos_elem.topic() && c.partition() == pos_elem.partition())
-                .and_then(|c| match c.offset() {
-                    rdkafka::Offset::Offset(o) => Some(o),
-                    _ => None,
+                .find(|c| c.topic() == topic && c.partition() == partition)
+                .map(|c| match c.offset() {
+                    rdkafka::Offset::Offset(o) => o,
+                    rdkafka::Offset::Beginning => low_watermark,
+                    rdkafka::Offset::End => high_watermark,
+                    _ => low_watermark,
                 })
-                .unwrap_or(0);
-            *lag_map.entry(pos_elem.topic().to_string()).or_insert(0) += pos_offset - commit_offset;
+                .unwrap_or(low_watermark);
+            let lag = (high_watermark - commit_offset).max(0);
+            *lag_map.entry(topic.to_string()).or_insert(0) += lag;
         }
         Ok(lag_map)
     }

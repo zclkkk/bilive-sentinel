@@ -146,7 +146,7 @@ curl http://localhost:8080/leases
 
 ### 消费延迟
 
-`bilive_consumer_lag` 报告 consumer 当前 position 与已提交 offset 的差值（按 topic）。延迟持续增长表示 writer 处理速度跟不上。
+`bilive_consumer_lag` 报告 broker high watermark 与已提交 offset 的差值（按 topic 聚合当前 writer 已分配的 partitions）。延迟持续增长表示 writer 处理速度跟不上。
 
 可能原因：
 - ClickHouse 写入延迟过高

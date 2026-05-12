@@ -198,7 +198,7 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 | `bilive_commit_errors_total` | Counter | `table`（danmaku/gifts） | Redpanda offset 提交失败次数 |
 | `bilive_batch_size` | Histogram | — | 写入批次大小 |
 | `bilive_insert_latency_seconds` | Histogram | — | ClickHouse 写入耗时 |
-| `bilive_consumer_lag` | Gauge | `topic` | Redpanda 消费延迟 |
+| `bilive_consumer_lag` | Gauge | `topic` | broker high watermark 与已提交 offset 的差值 |
 | `bilive_bad_messages_total` | Counter | `topic` | 无法反序列化的消息数（已提交 offset 跳过） |
 
 ### 全局
@@ -284,7 +284,6 @@ collector 和 writer 的所有字段都有默认值，省略不影响启动。
 |--------|--------------|------------|------|
 | registry 测试依赖本地 PostgreSQL | 是 | 可以 | 目前 `registry` 单元测试直接连接 `localhost:5432`，可改为 testcontainers、临时数据库，或将依赖基础设施的测试移动到集成测试。 |
 | writer commit 失败重试期间暂停消费 | 是 | 可以 | 当 batch 处于 inserted-pending-commit 状态时，writer 暂停消费新消息并重试 commit；可改为异步重试队列以减少消费暂停时间。 |
-| consumer lag 只读取本地 consumer 状态 | 是 | 可以 | 当前 lag 基于 consumer position 与 committed offset，不能代表 broker 端真实 high watermark lag；可改为按 partition 查询 watermark 后计算。 |
 | API 没有认证 | 是 | 可以 | 本地开发可接受，但生产或公网部署前需要加鉴权、网络隔离，或放在受保护的管理网内。 |
 
 ## 测试

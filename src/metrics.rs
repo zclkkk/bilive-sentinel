@@ -101,7 +101,7 @@ impl WriterMetrics {
         let consumer_lag = GaugeVec::new(
             Opts::new(
                 "bilive_consumer_lag",
-                "Redpanda consumer lag (position minus committed offset)",
+                "Redpanda consumer lag (broker high watermark minus committed offset)",
             ),
             &["topic"],
         )
