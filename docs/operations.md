@@ -1,97 +1,82 @@
-# 运维指南
+# Operations
 
-## 运行
+本文只描述怎么运行、验收、监控和排障。系统设计和数据语义见 [architecture.md](architecture.md)。
 
-### 本地开发
+## 环境要求
+
+- Rust 2024 edition
+- Podman，或兼容 compose 的 Docker
+- 本地端口可用：`5432`、`9092`、`8123`、`9000`、`8080`、`9100`、`9101`、`9102`
+
+## 本地基础设施
+
+启动：
 
 ```bash
-# 启动基础设施
 ./scripts/dev-up
-
-# 构建并运行
-cargo build
-cargo run --bin writer &
-cargo run --bin collector &
-cargo run --bin api &
-
-# 添加房间
-curl -X POST http://localhost:8080/rooms \
-  -H 'Content-Type: application/json' \
-  -d '{"room_id": 21484828}'
-
-# 查看日志
-# tracing 默认输出到 stderr
 ```
 
-### 单房间模式
-
-测试特定房间，不需要 PostgreSQL：
+查看状态：
 
 ```bash
-cargo run --bin collector -- --room-id 21484828
+podman compose ps
 ```
 
-从 Bilibili 获取鉴权信息，连接直播间，发布到 Redpanda。需要 Redpanda 运行。
-
-### 仅租约模式
-
-测试房间注册表，不连接 Bilibili：
+停止：
 
 ```bash
-# 先通过 API 添加房间
-curl -X POST http://localhost:8080/rooms \
-  -H 'Content-Type: application/json' \
-  -d '{"room_id": 12345}'
-
-# 认领租约但不连接
-cargo run --bin collector -- --lease-only --capacity 10
+./scripts/dev-down
 ```
 
-### 查看鉴权信息
+`scripts/dev-up` 使用 `compose.yml` 和 `compose.override.yml`，会启动：
 
-打印房间鉴权信息，不建立连接：
+| 服务 | 端口 | 用途 |
+|------|------|------|
+| PostgreSQL | `5432` | rooms 和 worker leases |
+| Redpanda | `9092` | Kafka API |
+| ClickHouse | `8123`、`9000` | HTTP 和 native 端口 |
+
+## 构建和测试
+
+完整检查：
 
 ```bash
-cargo run --bin collector -- --check-live-auth 21484828
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-## 监控
+测试依赖：
 
-### Prometheus 指标
+| 命令 | 依赖 |
+|------|------|
+| `cargo fmt --check` | 无外部服务 |
+| `cargo clippy --all-targets -- -D warnings` | 无外部服务 |
+| `cargo test --lib` | PostgreSQL，registry 测试会连接本地库 |
+| `cargo test --all-targets` | PostgreSQL、Redpanda、ClickHouse |
+| `cargo test --test multi_room_stability` | Redpanda、ClickHouse |
 
-每个二进制在配置的 `metrics_addr` 上暴露指标：
+## 启动服务
 
-- Collector: `http://localhost:9100/metrics`
-- Writer: `http://localhost:9101/metrics`
-- API: `http://localhost:9102/metrics`
-
-### 关键指标
-
-**Collector 健康：**
-- `bilive_active_rooms` — 应与预期房间数一致
-- `bilive_reconnects_total` — 速率过高表示网络或鉴权问题
-- `bilive_parser_errors_total` — 非零表示收到 Bilibili 的畸形消息
-- `bilive_publish_errors_total` — 非零表示事件发布到 Redpanda 失败，collector 会中断当前连接并重连
-
-**Writer 健康：**
-- `bilive_insert_latency_seconds` — p99 应低于 1 秒（本地 ClickHouse）
-- `bilive_consumer_lag` — 持续增长表示 writer 处理速度不足
-- `bilive_inserts_total` — 应稳定增长
-- `bilive_commit_errors_total` — 非零表示 ClickHouse 已写入但 Redpanda offset 提交失败，可能造成重放重复
-
-**全局：**
-- `bilive_sentinel_up` — 1 表示服务运行中
-
-### 健康检查
+三个进程通常分别运行：
 
 ```bash
-curl http://localhost:8080/health
-# 返回: ok
+cargo run --bin writer
+cargo run --bin api
+cargo run --bin collector
+```
+
+推荐先启动 `writer`，再启动 `api` 和 `collector`。`writer` 和 `collector` 都会确保 Redpanda topics 存在；`writer` 还会确保 ClickHouse 表存在。
+
+默认配置文件是 `config/default.toml`。可用 `-c` 指定配置：
+
+```bash
+cargo run --bin writer -- -c config/default.toml
 ```
 
 ## 房间管理
 
-### 添加房间
+添加房间：
 
 ```bash
 curl -X POST http://localhost:8080/rooms \
@@ -99,79 +84,284 @@ curl -X POST http://localhost:8080/rooms \
   -d '{"room_id": 21484828}'
 ```
 
-### 列出房间
+列出房间：
 
 ```bash
 curl http://localhost:8080/rooms
 ```
 
-### 启用/禁用房间
+禁用房间：
 
 ```bash
-# 禁用（collector 不再认领该房间）
 curl -X PUT http://localhost:8080/rooms/21484828/disable
+```
 
-# 启用
+启用房间：
+
+```bash
 curl -X PUT http://localhost:8080/rooms/21484828/enable
 ```
 
-禁用房间会删除该房间的当前租约并阻止新的认领。collector 会在下一次租约状态检查时停止已连接的房间任务。
-
-### 列出租约
+列出租约：
 
 ```bash
 curl http://localhost:8080/leases
 ```
 
-## 故障排查
+禁用房间会把 `rooms.enabled` 设为 false，并删除该房间当前 lease。collector 会在下一次房间状态检查时停止对应房间任务。
 
-### Collector 无法连接
+## Collector 运行模式
 
-1. 检查房间是否已添加：`curl http://localhost:8080/rooms`
-2. 检查房间是否已启用
-3. 查看 collector 日志中的鉴权错误
-4. 用 `--check-live-auth <room_id>` 验证 Bilibili API 访问
+默认 registry 模式：
 
-### Writer 延迟增长
+```bash
+cargo run --bin collector -- --capacity 100
+```
 
-1. 检查 `bilive_insert_latency_seconds` — ClickHouse 写入是否过慢
-2. 增大配置中的 `batch_size`（每批写入更多记录）
-3. 检查 ClickHouse 服务健康状况
+行为：
 
-### 重连风暴
+- 从 PostgreSQL 认领 enabled rooms
+- 每个认领房间启动一个 room task
+- 每 30 秒续租
+- 房间 disabled、lease lost 或超过重试上限时退出 room task
 
-1. 检查 `bilive_reconnects_total` 速率
-2. 增大 `reconnect_base_ms` 和 `reconnect_max_ms` 放慢重试
-3. 检查到 Bilibili WebSocket endpoint 的网络连通性
+单房间模式：
 
-### 消费延迟
+```bash
+cargo run --bin collector -- --room-id 21484828
+```
 
-`bilive_consumer_lag` 报告 broker high watermark 与已提交 offset 的差值（按 topic 聚合当前 writer 已分配的 partitions）。延迟持续增长表示 writer 处理速度跟不上。
+该模式不使用 PostgreSQL registry，但仍需要 Redpanda。
 
-可能原因：
-- ClickHouse 写入延迟过高
-- batch_size 太小（频繁小批量写入）
-- writer 到 ClickHouse 之间网络问题
+只检查 Bilibili 鉴权：
+
+```bash
+cargo run --bin collector -- --check-live-auth 21484828
+```
+
+仅租约模式：
+
+```bash
+cargo run --bin collector -- --lease-only --capacity 10
+```
+
+该模式只认领和续租，不连接 Bilibili，适合检查 registry 调度。
+
+## Prometheus 指标
+
+每个二进制在自己的 `metrics_addr` 暴露 `/metrics`：
+
+| 进程 | 地址 |
+|------|------|
+| collector | `http://localhost:9100/metrics` |
+| writer | `http://localhost:9101/metrics` |
+| api | `http://localhost:9102/metrics` |
+
+快速检查：
+
+```bash
+curl http://localhost:8080/health
+curl http://localhost:9100/metrics
+curl http://localhost:9101/metrics
+curl http://localhost:9102/metrics
+```
+
+关键指标：
+
+| 指标 | 判断 |
+|------|------|
+| `bilive_active_rooms` | 当前 collector 正在连接的房间数 |
+| `bilive_events_total` | collector 已解析并发布的事件数 |
+| `bilive_publish_errors_total` | 发布到 Redpanda 失败次数 |
+| `bilive_parser_errors_total` | Bilibili 消息解析失败次数 |
+| `bilive_reconnects_total` | 房间连接重试次数 |
+| `bilive_inserts_total` | ClickHouse insert 成功次数 |
+| `bilive_commit_errors_total` | Redpanda offset commit 失败次数 |
+| `bilive_insert_latency_seconds` | ClickHouse insert 延迟 |
+| `bilive_consumer_lag` | broker high watermark 与 committed offset 的差值，按 topic 聚合 |
+| `bilive_bad_messages_total` | writer 无法反序列化的消息数 |
+
+## ClickHouse 查询
+
+弹幕计数：
+
+```bash
+curl -G http://localhost:8123/ \
+  --data-urlencode 'query=SELECT room_id, count() FROM bilibili_live_danmaku GROUP BY room_id ORDER BY count() DESC LIMIT 10'
+```
+
+礼物计数：
+
+```bash
+curl -G http://localhost:8123/ \
+  --data-urlencode 'query=SELECT room_id, count() FROM bilibili_live_gifts GROUP BY room_id ORDER BY count() DESC LIMIT 10'
+```
+
+最近弹幕：
+
+```bash
+curl -G http://localhost:8123/ \
+  --data-urlencode 'query=SELECT room_id, uname, message, source_partition, source_offset FROM bilibili_live_danmaku ORDER BY received_at DESC LIMIT 10'
+```
+
+清空表需要 POST body。推荐：
+
+```bash
+curl -sS http://localhost:8123/ \
+  --data-binary 'TRUNCATE TABLE bilibili_live_danmaku'
+
+curl -sS http://localhost:8123/ \
+  --data-binary 'TRUNCATE TABLE bilibili_live_gifts'
+```
+
+## 实际验收流程
+
+以下流程用于确认真实采集和写入。
+
+1. 启动 infra：
+
+```bash
+./scripts/dev-up
+```
+
+2. 启动 `writer`、`api`、`collector`：
+
+```bash
+cargo run --bin writer
+cargo run --bin api
+cargo run --bin collector -- --capacity 2
+```
+
+3. 添加房间：
+
+```bash
+curl -X POST http://localhost:8080/rooms \
+  -H 'Content-Type: application/json' \
+  -d '{"room_id": 6154037}'
+
+curl -X POST http://localhost:8080/rooms \
+  -H 'Content-Type: application/json' \
+  -d '{"room_id": 23438368}'
+```
+
+4. 确认认领和连接：
+
+```bash
+curl http://localhost:8080/rooms
+curl http://localhost:8080/leases
+curl http://localhost:9100/metrics | rg 'bilive_active_rooms|bilive_events_total|bilive_reconnects_total|bilive_parser_errors_total|bilive_publish_errors_total'
+```
+
+5. 确认 ClickHouse 写入：
+
+```bash
+curl -G http://localhost:8123/ \
+  --data-urlencode "query=SELECT 'danmaku' AS table, room_id, count() FROM bilibili_live_danmaku WHERE room_id IN (6154037,23438368) GROUP BY room_id UNION ALL SELECT 'gifts' AS table, room_id, count() FROM bilibili_live_gifts WHERE room_id IN (6154037,23438368) GROUP BY room_id ORDER BY table, room_id"
+```
+
+6. 确认 writer lag：
+
+```bash
+curl http://localhost:9101/metrics | rg 'bilive_consumer_lag|bilive_commit_errors_total|bilive_inserts_total'
+```
+
+7. 禁用房间并确认停止：
+
+```bash
+curl -X PUT http://localhost:8080/rooms/6154037/disable
+curl -X PUT http://localhost:8080/rooms/23438368/disable
+curl http://localhost:8080/leases
+curl http://localhost:9100/metrics | rg 'bilive_active_rooms'
+```
+
+验收通过标准：
+
+- `/leases` 中能看到 enabled room 的有效租约
+- `/rooms` 中目标房间出现 `last_connected_at`，且 `last_error` 为 null 或可解释
+- `bilive_events_total` 增长
+- ClickHouse 对应房间有 danmaku 或 gift 记录
+- `bilive_consumer_lag` 最终回落或保持稳定
+- disable 后 lease 消失，`bilive_active_rooms` 降低
+
+## 排障
+
+### API 无法访问
+
+检查：
+
+```bash
+ss -ltnp | rg ':8080'
+curl http://localhost:8080/health
+```
+
+如果 API 启动失败，优先看 PostgreSQL 是否运行，以及 `config/default.toml` 中 `postgres.url` 是否正确。
+
+### Collector 没有认领房间
+
+检查：
+
+```bash
+curl http://localhost:8080/rooms
+curl http://localhost:8080/leases
+```
+
+确认房间 `enabled=true`，collector `--capacity` 大于 0，且没有其他 worker 持有未过期 lease。
+
+### Collector 连接失败或频繁重连
+
+检查：
+
+```bash
+cargo run --bin collector -- --check-live-auth <room_id>
+curl http://localhost:9100/metrics | rg 'bilive_reconnects_total|bilive_parser_errors_total|bilive_publish_errors_total'
+```
+
+常见原因：
+
+- Bilibili API 或 WebSocket endpoint 网络不可达
+- 房间不存在或不可访问
+- Redpanda 发布失败
+- Bilibili 返回了当前解析器不支持或畸形的消息
+
+### Writer 没有写入 ClickHouse
+
+检查：
+
+```bash
+curl http://localhost:9101/metrics | rg 'bilive_inserts_total|bilive_commit_errors_total|bilive_consumer_lag|bilive_bad_messages_total'
+curl -G http://localhost:8123/ --data-urlencode 'query=SHOW TABLES'
+```
+
+常见原因：
+
+- ClickHouse 不可达
+- Redpanda 没有事件
+- writer lag 持续增长，说明 writer 跟不上或 commit 失败
+- bad message 增长，说明 Redpanda 中有无法反序列化的 payload
+
+### ClickHouse 重复记录
+
+writer 是 at-least-once。若 ClickHouse insert 成功后，offset commit 失败并且进程崩溃，重启后 Redpanda 可能重放，ClickHouse 可能出现重复记录。用 `source_topic`、`source_partition`、`source_offset` 可以定位重复来源。
 
 ## 配置参考
 
-`config/default.toml` 所有字段：
+`config/default.toml`：
 
 | 节 | 字段 | 默认值 | 说明 |
 |----|------|--------|------|
-| log | level | info | 日志级别（trace/debug/info/warn/error） |
-| collector | metrics_addr | 0.0.0.0:9100 | Prometheus 指标监听地址 |
-| collector | startup_delay_ms | 200 | 启动时房间任务之间的延迟 |
-| collector | api_concurrency_limit | 10 | Bilibili API 最大并发数 |
-| collector | endpoint_rate_limit | 20 | WebSocket 最大并发建连数 |
-| collector | reconnect_base_ms | 1000 | 指数退避基准延迟 |
-| collector | reconnect_max_ms | 60000 | 退避最大延迟 |
-| collector | reconnect_max_retries | 10 | 超过此次数后放弃重连 |
-| writer | metrics_addr | 0.0.0.0:9101 | Prometheus 指标监听地址 |
-| writer | batch_size | 100 | 每批 ClickHouse 写入条数 |
-| writer | batch_timeout_ms | 5000 | 部分批次最大等待毫秒 |
-| api | listen_addr | 0.0.0.0:8080 | API 服务监听地址 |
-| api | metrics_addr | 0.0.0.0:9102 | Prometheus 指标监听地址 |
-| postgres | url | postgres://bilive:bilive@localhost:5432/bilive | PostgreSQL 连接 URL |
+| log | level | info | 日志级别 |
+| collector | metrics_addr | 0.0.0.0:9100 | collector metrics 地址 |
+| collector | startup_delay_ms | 200 | 启动房间任务之间的延迟 |
+| collector | api_concurrency_limit | 10 | Bilibili API 并发上限 |
+| collector | endpoint_rate_limit | 20 | WebSocket 建连并发上限 |
+| collector | reconnect_base_ms | 1000 | 指数退避基准 |
+| collector | reconnect_max_ms | 60000 | 指数退避上限 |
+| collector | reconnect_max_retries | 10 | 单次 room task 最大重试次数 |
+| writer | metrics_addr | 0.0.0.0:9101 | writer metrics 地址 |
+| writer | batch_size | 100 | 每批 ClickHouse 写入行数 |
+| writer | batch_timeout_ms | 5000 | 非满批次最大等待时间 |
+| api | listen_addr | 0.0.0.0:8080 | API 监听地址 |
+| api | metrics_addr | 0.0.0.0:9102 | API metrics 地址 |
+| postgres | url | postgres://bilive:bilive@localhost:5432/bilive | PostgreSQL URL |
 | clickhouse | url | http://localhost:8123 | ClickHouse HTTP URL |
-| redpanda | bootstrap_servers | localhost:9092 | Redpanda/Kafka bootstrap 地址 |
+| redpanda | bootstrap_servers | localhost:9092 | Kafka bootstrap 地址 |
