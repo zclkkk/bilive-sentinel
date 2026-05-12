@@ -3,12 +3,15 @@ mod batch;
 use anyhow::Result;
 use batch::{FlushOutcome, PendingBatch, try_flush};
 use bilive_sentinel::clickhouse::{ClickHouseWriter, DanmakuRow, GiftRow};
+use bilive_sentinel::metrics::WriterMetrics;
 use bilive_sentinel::protocol::{DanmakuEvent, GiftEvent};
 use bilive_sentinel::redpanda::{DANMAKU_TOPIC, GIFT_TOPIC, LiveMessage, RedpandaConsumer};
 use bilive_sentinel::{Config, init_tracing, new_service_registry, start_metrics_server};
 use clap::Parser;
 use rdkafka::message::Message;
 use std::time::Duration;
+
+const WRITER_GROUP_ID: &str = "bilive-sentinel-writer";
 
 #[derive(Parser)]
 struct Cli {
@@ -44,33 +47,53 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("ensure_topics: {e}"))?;
     tracing::info!("redpanda topics ready");
 
-    let consumer =
-        RedpandaConsumer::new(&config.redpanda.bootstrap_servers, "bilive-sentinel-writer");
-    consumer.subscribe(&[DANMAKU_TOPIC, GIFT_TOPIC]);
-    tracing::info!("subscribed to redpanda topics");
-
     let batch_size = config.writer.batch_size;
     let batch_timeout = Duration::from_millis(config.writer.batch_timeout_ms);
+    let clickhouse_url = config.clickhouse.url.clone();
+    let bootstrap_servers = config.redpanda.bootstrap_servers.clone();
+
+    tokio::try_join!(
+        run_danmaku_writer(
+            clickhouse_url.clone(),
+            bootstrap_servers.clone(),
+            batch_size,
+            batch_timeout,
+            writer_metrics.clone(),
+        ),
+        run_gift_writer(
+            clickhouse_url,
+            bootstrap_servers,
+            batch_size,
+            batch_timeout,
+            writer_metrics,
+        ),
+    )?;
+
+    Ok(())
+}
+
+async fn run_danmaku_writer(
+    clickhouse_url: String,
+    bootstrap_servers: String,
+    batch_size: usize,
+    batch_timeout: Duration,
+    writer_metrics: WriterMetrics,
+) -> Result<()> {
+    let ch = ClickHouseWriter::new(&clickhouse_url);
+    let consumer = RedpandaConsumer::new(&bootstrap_servers, WRITER_GROUP_ID);
+    consumer.subscribe(&[DANMAKU_TOPIC]);
+    tracing::info!(topic = DANMAKU_TOPIC, "writer subscribed to topic");
+
     let commit_retry_delay = Duration::from_millis(250);
 
     let mut danmaku_batch: PendingBatch<DanmakuRow> = PendingBatch::new();
-    let mut gift_batch: PendingBatch<GiftRow> = PendingBatch::new();
     let mut flush_interval = tokio::time::interval(batch_timeout);
     let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
 
     loop {
-        if danmaku_batch.inserted() || gift_batch.inserted() {
-            let mut commit_failed = false;
-            if danmaku_batch.inserted() {
-                let outcome =
-                    flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
-                commit_failed |= matches!(outcome, FlushOutcome::CommitFailed);
-            }
-            if gift_batch.inserted() {
-                let outcome = flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
-                commit_failed |= matches!(outcome, FlushOutcome::CommitFailed);
-            }
-            if commit_failed {
+        if danmaku_batch.inserted() {
+            let outcome = flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
+            if matches!(outcome, FlushOutcome::CommitFailed) {
                 tokio::select! {
                     biased;
                     _ = lag_interval.tick() => report_lag(&consumer, &writer_metrics),
@@ -84,6 +107,10 @@ async fn main() -> Result<()> {
             msg = consumer.recv() => {
                 let msg = msg.map_err(|e| anyhow::anyhow!(e))?;
                 let topic = msg.topic().to_string();
+                if topic != DANMAKU_TOPIC {
+                    tracing::warn!(topic, "message on unexpected topic");
+                    continue;
+                }
                 let partition = msg.partition();
                 let next_offset = msg.offset() + 1;
                 let payload = match msg.payload() {
@@ -91,68 +118,119 @@ async fn main() -> Result<()> {
                     None => {
                         tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, skipping");
                         writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                        match topic.as_str() {
-                            DANMAKU_TOPIC => danmaku_batch.advance_offset(&topic, partition, next_offset),
-                            GIFT_TOPIC => gift_batch.advance_offset(&topic, partition, next_offset),
-                            _ => {}
-                        }
+                        danmaku_batch.advance_offset(&topic, partition, next_offset);
                         continue;
                     }
                 };
 
                 let consumed_offset = msg.offset();
 
-                match topic.as_str() {
-                    DANMAKU_TOPIC => {
-                        match serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
-                            Ok(wrapper) => {
-                                danmaku_batch.push(
-                                    danmaku_to_row(&wrapper, &topic, partition, consumed_offset),
-                                    &topic,
-                                    partition,
-                                    next_offset,
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, topic, "bad danmaku payload, skipping");
-                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                                danmaku_batch.advance_offset(&topic, partition, next_offset);
-                            }
-                        }
+                match serde_json::from_slice::<LiveMessage<DanmakuEvent>>(payload) {
+                    Ok(wrapper) => {
+                        danmaku_batch.push(
+                            danmaku_to_row(&wrapper, &topic, partition, consumed_offset),
+                            &topic,
+                            partition,
+                            next_offset,
+                        );
                     }
-                    GIFT_TOPIC => {
-                        match serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
-                            Ok(wrapper) => {
-                                gift_batch.push(
-                                    gift_to_row(&wrapper, &topic, partition, consumed_offset),
-                                    &topic,
-                                    partition,
-                                    next_offset,
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, topic, "bad gift payload, skipping");
-                                writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
-                                gift_batch.advance_offset(&topic, partition, next_offset);
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::warn!(topic, "message on unknown topic");
+                    Err(e) => {
+                        tracing::warn!(error = %e, topic, "bad danmaku payload, skipping");
+                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                        danmaku_batch.advance_offset(&topic, partition, next_offset);
                     }
                 }
 
                 if danmaku_batch.len() >= batch_size {
                     flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
                 }
-                if gift_batch.len() >= batch_size {
-                    flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
-                }
             }
             _ = flush_interval.tick() => {
                 if danmaku_batch.has_pending_offsets() {
                     flush_danmaku(&ch, &consumer, &mut danmaku_batch, &writer_metrics).await;
                 }
+            }
+            _ = lag_interval.tick() => {
+                report_lag(&consumer, &writer_metrics);
+            }
+        }
+    }
+}
+
+async fn run_gift_writer(
+    clickhouse_url: String,
+    bootstrap_servers: String,
+    batch_size: usize,
+    batch_timeout: Duration,
+    writer_metrics: WriterMetrics,
+) -> Result<()> {
+    let ch = ClickHouseWriter::new(&clickhouse_url);
+    let consumer = RedpandaConsumer::new(&bootstrap_servers, WRITER_GROUP_ID);
+    consumer.subscribe(&[GIFT_TOPIC]);
+    tracing::info!(topic = GIFT_TOPIC, "writer subscribed to topic");
+
+    let commit_retry_delay = Duration::from_millis(250);
+
+    let mut gift_batch: PendingBatch<GiftRow> = PendingBatch::new();
+    let mut flush_interval = tokio::time::interval(batch_timeout);
+    let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
+
+    loop {
+        if gift_batch.inserted() {
+            let outcome = flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
+            if matches!(outcome, FlushOutcome::CommitFailed) {
+                tokio::select! {
+                    biased;
+                    _ = lag_interval.tick() => report_lag(&consumer, &writer_metrics),
+                    _ = tokio::time::sleep(commit_retry_delay) => {}
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            msg = consumer.recv() => {
+                let msg = msg.map_err(|e| anyhow::anyhow!(e))?;
+                let topic = msg.topic().to_string();
+                if topic != GIFT_TOPIC {
+                    tracing::warn!(topic, "message on unexpected topic");
+                    continue;
+                }
+                let partition = msg.partition();
+                let next_offset = msg.offset() + 1;
+                let payload = match msg.payload() {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(topic, partition, offset = msg.offset(), "empty payload, skipping");
+                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                        gift_batch.advance_offset(&topic, partition, next_offset);
+                        continue;
+                    }
+                };
+
+                let consumed_offset = msg.offset();
+
+                match serde_json::from_slice::<LiveMessage<GiftEvent>>(payload) {
+                    Ok(wrapper) => {
+                        gift_batch.push(
+                            gift_to_row(&wrapper, &topic, partition, consumed_offset),
+                            &topic,
+                            partition,
+                            next_offset,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, topic, "bad gift payload, skipping");
+                        writer_metrics.bad_messages_total.with_label_values(&[&topic]).inc();
+                        gift_batch.advance_offset(&topic, partition, next_offset);
+                    }
+                }
+
+                if gift_batch.len() >= batch_size {
+                    flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
+                }
+            }
+            _ = flush_interval.tick() => {
                 if gift_batch.has_pending_offsets() {
                     flush_gifts(&ch, &consumer, &mut gift_batch, &writer_metrics).await;
                 }
@@ -164,7 +242,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn report_lag(consumer: &RedpandaConsumer, metrics: &bilive_sentinel::metrics::WriterMetrics) {
+fn report_lag(consumer: &RedpandaConsumer, metrics: &WriterMetrics) {
     match consumer.report_lag() {
         Ok(lag_map) => {
             for (topic, lag) in lag_map {
