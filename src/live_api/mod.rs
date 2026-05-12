@@ -1,8 +1,6 @@
-mod cache;
 mod client;
 mod wbi;
 
-pub use cache::AuthCache;
 pub use client::LiveApiClient;
 
 use serde::{Deserialize, Serialize};
@@ -190,22 +188,5 @@ mod tests {
             LiveApiError::Parse(_) => {}
             _ => panic!("expected Parse error"),
         }
-    }
-
-    #[tokio::test]
-    async fn cache_refresh_on_expiry() {
-        let api = MockLiveApi::new().with_auth(123, make_auth(123));
-        let mut cache = AuthCache::new(std::time::Duration::from_secs(60));
-
-        let auth = api.fetch_live_auth(123).await.unwrap();
-        cache.insert(123, auth);
-        assert_eq!(cache.get(123).unwrap().room_id, 123);
-
-        cache.remove(123);
-        assert!(cache.get(123).is_none());
-
-        let auth = api.fetch_live_auth(123).await.unwrap();
-        cache.insert(123, auth);
-        assert_eq!(cache.get(123).unwrap().room_id, 123);
     }
 }
